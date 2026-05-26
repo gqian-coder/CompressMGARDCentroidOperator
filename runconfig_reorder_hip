@@ -1,0 +1,52 @@
+#!/bin/bash
+# Build + runtime configuration for the GPU (HIP) variant of the centroid
+# operator that performs the centroid split AND Hilbert SFC reorder on the
+# AMD GPU (libCompressMGARDCentroidOperator_GPU.so).
+#
+# Usage:
+#   mkdir -p build && cd build && source ../runconfig_reorder_hip && make -j 8
+#
+ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios
+MGARD_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD/install-hip-frontier
+
+# Load ROCm / HIP toolchain on Frontier (gfx90a, MI250X).
+source ~/frontier_model_to_load.sh 2>/dev/null
+export PATH=/opt/rocm-6.2.4/bin:$PATH
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_DIR}" \
+  -DENABLE_HIP=ON \
+  -DGPU_TARGETS="gfx90a"
+
+cat <<'EOF'
+
+Configuration complete.  Run "make -j 8" to build both libraries:
+   libCompressMGARDCentroidOperator.so       (CPU operator)
+   libCompressMGARDCentroidOperator_GPU.so   (GPU operator: centroid + Hilbert)
+
+──────────────────────────────────────────────────────────────────
+Runtime environment for the GPU operator (copy-paste ready):
+──────────────────────────────────────────────────────────────────
+   export CENTROID_GPU=1
+   export ADIOS2_PLUGIN_PATH=/lustre/orion/cfd164/proj-shared/gongq/CompressMGARDCentroidOperator/build_hip
+   export MGARD_X_DEVICE_TYPE=HIP
+   export CENTROID_SFC=on
+   export CENTROID_SFC_TYPE=hilbert
+
+   # Then run the wrapper (example):
+   #   ./mgardCentroid_adios_ge input.bp out.bp 1e-4 0.5
+
+   # CENTROID_GPU=1 selects libCompressMGARDCentroidOperator_GPU.so.
+   # ADIOS2_PLUGIN_PATH must point to build_hip/ (contains the _GPU .so).
+   # MGARD_X_DEVICE_TYPE=HIP makes MGARD-X also run on the MI250X.
+   # CENTROID_SFC=on + CENTROID_SFC_TYPE=hilbert enable Hilbert SFC reorder.
+──────────────────────────────────────────────────────────────────
+
+To use the CPU operator instead (leave CENTROID_GPU unset or 0):
+   export ADIOS2_PLUGIN_PATH=/lustre/orion/cfd164/proj-shared/gongq/CompressMGARDCentroidOperator/build
+   unset CENTROID_GPU
+
+To force the GPU-operator CPU fallback (no GPU available on login nodes):
+   export HIP_VISIBLE_DEVICES=""           # GPU operator falls back to CPU path
+EOF
