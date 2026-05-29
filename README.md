@@ -72,12 +72,6 @@ export CENTROID_DEVICE=cpu
 export MGARD_X_DEVICE_TYPE=SERIAL
 ```
 
-> **Note (temporary):** `runconf_hip` currently unloads `cray-hdf5` and
-> `cray-netcdf` and points `ADIOS2_DIR` at the PrgEnv-gnu ADIOS2 install
-> (`install-adios`). This workaround (`LINKER:--as-needed` in CMakeLists) is
-> needed until ADIOS2 is rebuilt with PrgEnv-cray (`install-adios-cray`).
-> Once that rebuild is done, remove the `module unload` lines and update
-> `ADIOS2_DIR` to `install-adios-cray`.
 
 ## Operator parameters
 
