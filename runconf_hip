@@ -1,0 +1,53 @@
+#!/bin/bash
+# HIP (GPU) build configuration for CompressMGARDCentroidOperator.
+# Usage (from the repo root):
+#   mkdir build_hip && cd build_hip && source ../runconf_hip && make -j$(nproc)
+#
+# All four components (ADIOS2, MGARD-HIP, centroid operator, Unstructured-ReMesh)
+# are built with the same module set from ~/frontier_model_to_load.sh:
+#   rocm/6.2.4  craype-accel-amd-gfx90a  PrgEnv-cray  cray-hdf5  cray-mpich
+
+unset LD_PRELOAD
+export LIBRARY_PATH=/opt/xpmem/lib64:${LIBRARY_PATH:-}
+
+# Load the project-wide module set.
+source ~/frontier_model_to_load.sh
+# WORKAROUND: unload HDF5/NetCDF so Cray PE wrapper does not inject
+# libhdf5_crayclang_170 into the link, which conflicts with the PrgEnv-gnu
+# ADIOS2 build (libhdf5_gnu_123).  Remove once ADIOS2 rebuilt with PrgEnv-cray.
+module unload cray-hdf5 cray-netcdf
+
+ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios
+MGARD_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD/install-hip-frontier
+MGARD_SERIAL_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD-serial/install-serial
+ZSTD_LIB=${MGARD_DIR}/lib/libzstd.so
+
+# Resolve compilers from the loaded environment so the build is not tied to
+# a specific craype or ROCm version string in /opt.
+CRAY_CC=$(which CC)
+HIP_CXX="${ROCM_PATH}/lib/llvm/bin/clang++"
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DENABLE_HIP=ON \
+  -DCMAKE_CXX_COMPILER="${CRAY_CC}" \
+  -DCMAKE_HIP_COMPILER="${HIP_CXX}" \
+  -DCMAKE_HIP_ARCHITECTURES=gfx90a \
+  -DMGARD_SERIAL_DIR="${MGARD_SERIAL_DIR}" \
+  -DZSTD_LIBRARY="${ZSTD_LIB}" \
+  -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_DIR}"
+
+echo ""
+echo "Configuration complete. Run 'make' to build."
+echo "Library will be: libCompressMGARDCentroidOperator.so (unified V5, CPU+HIP)"
+echo ""
+echo "Runtime env (GPU path):"
+echo "  export ADIOS2_PLUGIN_PATH=\$(pwd)"
+echo "  export CENTROID_DEVICE=gpu"
+echo "  export MGARD_X_DEVICE_TYPE=HIP    # mgard_x::compress for cell averages"
+echo "  export CENTROID_SFC=on"
+echo "  export CENTROID_SFC_TYPE=hilbert"
+echo ""
+echo "To force CPU code path from the same .so:"
+echo "  export CENTROID_DEVICE=cpu"
+echo "  export MGARD_X_DEVICE_TYPE=SERIAL"

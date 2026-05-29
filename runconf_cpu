@@ -1,0 +1,38 @@
+#!/bin/bash
+# CPU-only build configuration for CompressMGARDCentroidOperator.
+# Usage (from the repo root):
+#   mkdir build && cd build && source ../runconf_cpu && make -j$(nproc)
+#
+# Works from any Frontier login node as long as ~/frontier_model_to_load.sh
+# loads: PrgEnv-cray  cray-mpich  cmake
+
+unset LD_PRELOAD
+export LIBRARY_PATH=/opt/xpmem/lib64:${LIBRARY_PATH:-}
+
+# Load Cray PE environment.
+source ~/frontier_model_to_load.sh
+module unload cray-hdf5 cray-netcdf
+
+ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios
+MGARD_SERIAL_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD-serial/install-serial
+
+# Resolve Cray CXX wrapper from loaded environment.
+CRAY_CC=$(which CC)
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DENABLE_HIP=OFF \
+  -DCMAKE_CXX_COMPILER="${CRAY_CC}" \
+  -DMGARD_SERIAL_DIR="${MGARD_SERIAL_DIR}" \
+  -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_SERIAL_DIR}"
+
+echo ""
+echo "Configuration complete. Run 'make' to build."
+echo "Library will be: libCompressMGARDCentroidOperator.so (unified V5, CPU-only)"
+echo ""
+echo "Runtime env:"
+echo "  export ADIOS2_PLUGIN_PATH=\$(pwd)"
+echo "  export CENTROID_DEVICE=cpu        # default; HIP backend not built"
+echo "  export MGARD_X_DEVICE_TYPE=SERIAL # mgard-x lossless backend"
+echo "  export CENTROID_SFC=on"
+echo "  export CENTROID_SFC_TYPE=hilbert"

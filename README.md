@@ -17,14 +17,67 @@ See `../Unstructured-Centroid/Plan.md` (now in this directory) for the design
 rationale and a comparison against the per-cell-duplicate (Option A) and
 single-owner (Option B) alternatives.
 
-## Building (CPU-only)
+## Build configurations
+
+Two `runconf` scripts are provided. Run either from a fresh build directory
+inside the repo root.
+
+### `runconf_cpu` — CPU-only (SERIAL backend)
+
+Use when:
+- No GPU is available or needed.
+- Debugging the centroid split/recombine logic on a login node.
+- Linking against a CPU-only MGARD install (`MGARD-serial/install-serial`).
 
 ```bash
 mkdir build && cd build
 source ../runconf_cpu
-make
+make -j$(nproc)
 export ADIOS2_PLUGIN_PATH=$(pwd)
 ```
+
+Runtime defaults with this build:
+```bash
+export CENTROID_DEVICE=cpu        # only option; HIP backend not compiled
+export MGARD_X_DEVICE_TYPE=SERIAL
+export CENTROID_SFC=on
+export CENTROID_SFC_TYPE=hilbert
+```
+
+### `runconf_hip` — CPU+HIP (GPU) unified build
+
+Use when:
+- Running on Frontier (AMD Instinct MI210/MI300, `gfx90a`).
+- You want GPU-accelerated cell-average compression via `mgard_x::compress`
+  (HIP backend) while the residual quantization/lossless path stays on CPU.
+- A/B profiling of serial vs HIP Huffman paths (`CMG_HUFF_AB=1`).
+
+```bash
+mkdir build_hip && cd build_hip
+source ../runconf_hip
+make -j$(nproc)
+export ADIOS2_PLUGIN_PATH=$(pwd)
+```
+
+The same `.so` supports both GPU and CPU paths at runtime:
+```bash
+# GPU path (cell averages compressed on GPU):
+export CENTROID_DEVICE=gpu
+export MGARD_X_DEVICE_TYPE=HIP
+export CENTROID_SFC=on
+export CENTROID_SFC_TYPE=hilbert
+
+# CPU fallback from the same HIP-built .so:
+export CENTROID_DEVICE=cpu
+export MGARD_X_DEVICE_TYPE=SERIAL
+```
+
+> **Note (temporary):** `runconf_hip` currently unloads `cray-hdf5` and
+> `cray-netcdf` and points `ADIOS2_DIR` at the PrgEnv-gnu ADIOS2 install
+> (`install-adios`). This workaround (`LINKER:--as-needed` in CMakeLists) is
+> needed until ADIOS2 is rebuilt with PrgEnv-cray (`install-adios-cray`).
+> Once that rebuild is done, remove the `module unload` lines and update
+> `ADIOS2_DIR` to `install-adios-cray`.
 
 ## Operator parameters
 
@@ -51,9 +104,14 @@ A reference wrapper that reads `/<zone>/FlowSolution/*` from the example
 3-D rotor case and drives this operator block-by-block lives at
 `/lustre/orion/cfd164/proj-shared/gongq/Unstructured-ReMesh/mgardCentroid_adios_ge.cpp`.
 
-## GPU portability
+## GPU support
 
-The split / recombine kernels are isolated in template functions
-(`CentroidSplit_CPU`, `CentroidRecombine_CPU`) so that a HIP/CUDA backend can
-be added later behind a runtime flag, mirroring the structure of
-`CompressMGARDMeshToGridOperator`. MGARD itself is already CPU/GPU portable.
+HIP support is fully implemented (`ENABLE_HIP=ON`). The cell-average
+compression uses `mgard_x::compress` with the HIP device type; the nodal
+residual quantization and lossless stages run on CPU (SERIAL path) in both
+build variants.
+
+The split/recombine kernels (`CentroidSplit`, `CentroidRecombine`) dispatch
+to either a CPU or GPU implementation at runtime via `CENTROID_DEVICE`.
+MGARD itself is CPU/GPU portable and the same operator `.so` handles both
+paths when built with `ENABLE_HIP=ON`.
