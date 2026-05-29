@@ -89,7 +89,7 @@ export MGARD_X_DEVICE_TYPE=SERIAL
 | `blockid`               | yes | Index of the block being compressed (set per `Put`). |
 | `tolerance`             | yes | Absolute error bound for the reconstructed field. |
 | `mode`                  | no  | Only `"ABS"` is supported (caller must convert REL→ABS). |
-| `ebratio`               | no  | Fraction of the budget allocated to the residual component. Default `0.5`. `tol_resi = ebratio * tolerance`, `tol_avg = (1 - ebratio) * tolerance`. |
+| `ebratio`               | no  | Fraction of the budget allocated to the residual component. Default `0.8`. `tol_resi = ebratio * tolerance`, `tol_avg = (1 - ebratio) * tolerance`. |
 | `s`                     | no  | MGARD `s` (smoothness) parameter. Default `0` (L∞-type bound). |
 | `threshold`             | no  | Skip compression for blocks smaller than this many bytes. Default `100000`. |
 

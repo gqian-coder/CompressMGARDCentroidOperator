@@ -356,7 +356,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
                                              "Operate", "missing mandatory parameter 'tolerance' (ABS)");
 
-    double ebratio = 0.5;
+    double ebratio = 0.8;
     {
         auto it = m_Parameters.find("ebratio");
         if (it != m_Parameters.end()) ebratio = std::stod(it->second);
