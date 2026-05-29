@@ -12,12 +12,8 @@ export LIBRARY_PATH=/opt/xpmem/lib64:${LIBRARY_PATH:-}
 
 # Load the project-wide module set.
 source ~/frontier_model_to_load.sh
-# WORKAROUND: unload HDF5/NetCDF so Cray PE wrapper does not inject
-# libhdf5_crayclang_170 into the link, which conflicts with the PrgEnv-gnu
-# ADIOS2 build (libhdf5_gnu_123).  Remove once ADIOS2 rebuilt with PrgEnv-cray.
-module unload cray-hdf5 cray-netcdf
 
-ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios
+ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios-cray
 MGARD_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD/install-hip-frontier
 MGARD_SERIAL_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD-serial/install-serial
 ZSTD_LIB=${MGARD_DIR}/lib/libzstd.so

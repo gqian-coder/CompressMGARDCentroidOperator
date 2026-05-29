@@ -140,12 +140,6 @@ else()
     PUBLIC mgard_serial)
 endif()
 
-# WORKAROUND: ADIOS2 is still PrgEnv-gnu (libhdf5_gnu_123); the plugin is
-# PrgEnv-cray (libhdf5_crayclang_170).  --as-needed prevents Cray HDF5 from
-# appearing in DT_NEEDED since the plugin makes no HDF5 API calls directly.
-# Remove this once ADIOS2 is rebuilt with PrgEnv-cray (install-adios-cray).
-target_link_options(CompressMGARDCentroidOperator PRIVATE "LINKER:--as-needed")
-
 include(GenerateExportHeader)
 generate_export_header(CompressMGARDCentroidOperator
                        BASE_NAME compress_mgard_centroid)
