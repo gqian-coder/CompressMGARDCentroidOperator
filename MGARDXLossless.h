@@ -69,6 +69,12 @@ std::size_t Compress(const std::uint32_t *d_quant, std::size_t n,
 bool Decompress(const char *h_in, std::size_t in_len,
                 std::size_t n, std::uint32_t *d_quant_out);
 
+/* Convenience: same as Compress(), but takes a HOST pointer. The function
+ * allocates a temporary device buffer, copies H2D, runs HIP Huffman+Zstd,
+ * frees the buffer. Use for A/B measurements vs. serial::Compress. */
+std::size_t CompressFromHost(const std::uint32_t *h_quant, std::size_t n,
+                             char *h_out, std::size_t h_out_cap);
+
 } // namespace hip
 
 } // namespace mgardx_lossless

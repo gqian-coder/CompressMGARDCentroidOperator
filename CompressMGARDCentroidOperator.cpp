@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -251,6 +252,22 @@ mgard_x::Config MakeMgardConfig(cmg_backend_t be)
         else if (s == "OPENMP") cfg.dev_type = mgard_x::device_type::OPENMP;
         else if (s == "AUTO")   cfg.dev_type = mgard_x::device_type::AUTO;
     }
+    /* Huffman tuning: smaller dict_size concentrates the codebook on the
+     * most-frequent symbols, keeping code lengths short. The GPU parallel
+     * Huffman (GenerateCL kernel) can produce degenerate 60+ bit codewords
+     * when the frequency histogram is nearly flat across 8192 bins (happens
+     * at tight tolerances). A smaller dict forces more outlier-bypass and
+     * avoids that degenerate case. */
+    if (const char *e = std::getenv("MGARDX_HUFF_DICT"); e && *e)
+    {
+        try { cfg.huff_dict_size = static_cast<mgard_x::SIZE>(std::stol(e)); }
+        catch (...) {}
+    }
+    if (const char *e = std::getenv("MGARDX_HUFF_BLOCK"); e && *e)
+    {
+        try { cfg.huff_block_size = static_cast<mgard_x::SIZE>(std::stol(e)); }
+        catch (...) {}
+    }
     return cfg;
 }
 
@@ -409,14 +426,8 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     /* ---- centroid split ---- */
     std::vector<char> cellAvgBuf (ncells * typeSize);
     std::vector<char> residualBuf(nnodes * typeSize);
-    const bool zeroAvg = (std::getenv("CENTROID_ZERO_AVG") != nullptr);
     const auto t_split0 = high_resolution_clock::now();
-    if (zeroAvg)
-    {
-        std::memset(cellAvgBuf.data(), 0, cellAvgBuf.size());
-        std::memcpy(residualBuf.data(), dataIn, inputBytes);
-    }
-    else if (type == helper::GetDataType<float>())
+    if (type == helper::GetDataType<float>())
     {
         cmg_centroid_split_f32(m_Backend,
             reinterpret_cast<const float *>(dataIn), conn.data(),
@@ -437,7 +448,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     /* ---- SFC reorder of cell averages ---- */
     cmg_sfc_t sfcMode = CMG_SFC_NONE;
     const auto t_sfc0 = high_resolution_clock::now();
-    if (!zeroAvg && IsSFCEnabled(m_Parameters))
+    if (IsSFCEnabled(m_Parameters))
     {
         const double *cx = nullptr, *cy = nullptr, *cz = nullptr;
         const bool haveCoords =
@@ -536,6 +547,41 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     const auto t_h0 = high_resolution_clock::now();
     size_t cap_res = mgardx_lossless::serial::Compress(quant.data(), nnodes, outRes, resCap);
     const auto t_h1 = high_resolution_clock::now();
+
+#ifdef CMG_HAVE_HIP
+    /* Optional A/B measurement: also run the HIP Huffman path on the same
+     * uint32 quant buffer and log both sizes side-by-side. Enabled by
+     * env var CMG_HUFF_AB=1 (HIP build only). */
+    if (const char *ab = std::getenv("CMG_HUFF_AB"); ab && *ab && *ab != '0')
+    {
+        std::vector<char> tmp(resCap);
+        const auto t_ab0 = high_resolution_clock::now();
+        size_t hip_bytes = mgardx_lossless::hip::CompressFromHost(
+            quant.data(), nnodes, tmp.data(), resCap);
+        const auto t_ab1 = high_resolution_clock::now();
+        const double ms_ser = duration<double, std::milli>(t_h1 - t_h0).count();
+        const double ms_hip = duration<double, std::milli>(t_ab1 - t_ab0).count();
+        std::cerr << "[HUFF_AB] block=" << m_BlockId
+                  << " nnodes=" << nnodes
+                  << " tol_resi=" << tol_resi
+                  << " serial_bytes=" << cap_res
+                  << " hip_bytes=" << hip_bytes
+                  << " serial_ms=" << ms_ser
+                  << " hip_ms=" << ms_hip
+                  << "\n";
+        if (const char *logp = std::getenv("CMG_HUFF_AB_LOG"); logp && *logp)
+        {
+            FILE *f = std::fopen(logp, "a");
+            if (f)
+            {
+                std::fprintf(f, "%zu,%zu,%g,%zu,%zu,%g,%g\n",
+                             (size_t)m_BlockId, nnodes, tol_resi,
+                             cap_res, hip_bytes, ms_ser, ms_hip);
+                std::fclose(f);
+            }
+        }
+    }
+#endif
 
     uint8_t actualResMarker = kResMarker_MGARDX_Huff;
     if (cap_res == 0)

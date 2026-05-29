@@ -61,12 +61,17 @@ add_library(mgardx_lossless_serial STATIC
 set_source_files_properties(MGARDXLossless_SERIAL.cpp PROPERTIES LANGUAGE CXX)
 target_include_directories(mgardx_lossless_serial PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
-# Backend now uses libzstd directly (MGARD-X ComposedLosslessCompressor is
-# broken in the HIP-install build of MGARD on Frontier).
+# Uses Huffman+Zstd (ComposedLosslessCompressor<SERIAL>) when max_code <
+# dict_size, raw Zstd otherwise.  outlier_count uninitialized bug patched
+# in-place without modifying MGARD-X headers.
+set(ZSTD_LIBRARY "${MGARD_SERIAL_DIR}/lib/libzstd.so"
+    CACHE FILEPATH "Path to libzstd.so used by mgardx_lossless_serial")
+
 target_include_directories(mgardx_lossless_serial PRIVATE
   "${MGARD_SERIAL_DIR}/include")
 target_link_libraries(mgardx_lossless_serial
-  PRIVATE "${MGARD_SERIAL_DIR}/lib/libzstd.so")
+  PRIVATE ${_MGARDX_LOSSLESS_SERIAL_MGARD}
+          "${ZSTD_LIBRARY}")
 set_target_properties(mgardx_lossless_serial PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
@@ -135,6 +140,12 @@ else()
     PUBLIC mgard_serial)
 endif()
 
+# WORKAROUND: ADIOS2 is still PrgEnv-gnu (libhdf5_gnu_123); the plugin is
+# PrgEnv-cray (libhdf5_crayclang_170).  --as-needed prevents Cray HDF5 from
+# appearing in DT_NEEDED since the plugin makes no HDF5 API calls directly.
+# Remove this once ADIOS2 is rebuilt with PrgEnv-cray (install-adios-cray).
+target_link_options(CompressMGARDCentroidOperator PRIVATE "LINKER:--as-needed")
+
 include(GenerateExportHeader)
 generate_export_header(CompressMGARDCentroidOperator
                        BASE_NAME compress_mgard_centroid)
@@ -168,7 +179,7 @@ if(ENABLE_HIP)
   add_executable(mgardx_cr_probe_hip tests/mgardx_cr_probe.cpp)
   set_source_files_properties(tests/mgardx_cr_probe.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(mgardx_cr_probe_hip PRIVATE
-    mgardx_lossless_hip hip::device)
+    mgardx_lossless_serial mgardx_lossless_hip hip::device)
   target_compile_definitions(mgardx_cr_probe_hip PRIVATE
     __HIP_PLATFORM_AMD__ ENABLE_HIP MGARDX_COMPILE_HIP CMG_PROBE_WITH_HIP)
   set_target_properties(mgardx_cr_probe_hip PROPERTIES
