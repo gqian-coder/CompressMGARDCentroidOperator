@@ -22,6 +22,7 @@
  *   uint8    MGARD_VERSION_MINOR
  *   uint8    MGARD_VERSION_PATCH
  *   bool     isCompressed
+ *   ── if !isCompressed: raw input bytes follow (below-threshold path) ─
  *   ── if isCompressed: ────────────────────────────────────────────
  *   size_t   ncells
  *   size_t   nodes_per_cell
@@ -43,8 +44,7 @@
 #define COMPRESSMGARDCENTROIDOPERATOR_H_
 
 #include "adios2.h"
-#include "adios2/common/ADIOSTypes.h"
-#include "adios2/operator/plugin/PluginOperatorInterface.h"
+#include "adios2/plugin/PluginOperatorInterface.h"
 
 #include "DeviceKernels.h"
 
@@ -68,15 +68,12 @@ public:
 
     bool IsDataTypeValid(const DataType type) const override;
 
-    size_t GetHeaderSize() const override;
-
     size_t GetEstimatedSize(const size_t ElemCount, const size_t ElemSize,
                             const size_t ndims, const size_t *dims) const override;
 
 private:
     size_t DecompressV5(const char *bufferIn, const size_t sizeIn, char *dataOut);
 
-    size_t headerSize = 0;
     std::string m_VersionInfo;
     std::string m_MeshFile;
     std::string m_ConnVarName;
