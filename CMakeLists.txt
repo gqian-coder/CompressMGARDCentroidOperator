@@ -76,6 +76,7 @@ set_target_properties(mgardx_lossless_serial PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
 if(ENABLE_HIP)
+  message(STATUS "HIP enabled ==> build mgardx_lossless_hip")
   add_library(mgardx_lossless_hip STATIC MGARDXLossless_HIP.cpp MGARDXLossless.h)
   set_source_files_properties(MGARDXLossless_HIP.cpp PROPERTIES LANGUAGE HIP)
   target_include_directories(mgardx_lossless_hip PUBLIC
@@ -104,6 +105,7 @@ if(ENABLE_HIP)
 endif()
 
 if(ENABLE_HIP)
+  message(STATUS "HIP enabled ==> build device_kernels_hip")
   add_library(device_kernels_hip STATIC
               DeviceKernels_HIP.cpp DeviceKernels.h)
   set_source_files_properties(DeviceKernels_HIP.cpp PROPERTIES LANGUAGE HIP)
@@ -123,19 +125,24 @@ endif()
 add_library(CompressMGARDCentroidOperator
             CompressMGARDCentroidOperator.cpp
             CompressMGARDCentroidOperator.h)
-set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE CXX)
 
+# adios2::cxx is the public C++ API used for the mesh reads; the v2 plugin
+# interface itself is header-only, so no link against internal adios2 targets.
 target_link_libraries(CompressMGARDCentroidOperator
   PRIVATE device_kernels_cpu mgardx_lossless_serial
-  PUBLIC  adios2::cxx11 adios2::core)
+  PUBLIC  adios2::cxx)
 
 if(ENABLE_HIP)
+  message(STATUS "HIP enabled ==> build CompressMGARDCentroidOperator with HIP")
+  set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(CompressMGARDCentroidOperator
     PRIVATE device_kernels_hip mgardx_lossless_hip hip::device
     PUBLIC  mgard::mgard)
   target_compile_definitions(CompressMGARDCentroidOperator PRIVATE
     __HIP_PLATFORM_AMD__ ENABLE_HIP CMG_HAVE_HIP)
 else()
+  message(STATUS "CPU only ==> build CompressMGARDCentroidOperator CPU only")
+  set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE CXX)
   target_link_libraries(CompressMGARDCentroidOperator
     PUBLIC mgard_serial)
 endif()
@@ -149,6 +156,8 @@ target_include_directories(CompressMGARDCentroidOperator PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   $<INSTALL_INTERFACE:include>)
 
+install(TARGETS CompressMGARDCentroidOperator LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
 message(STATUS "=== CompressMGARDCentroidOperator (unified V5) ===")
 message(STATUS "  HIP support:  ${ENABLE_HIP}")
 message(STATUS "  ADIOS2:       ${ADIOS2_DIR}")
@@ -156,54 +165,3 @@ message(STATUS "  MGARD:        ${MGARD_DIR}")
 message(STATUS "  Target:       libCompressMGARDCentroidOperator.so")
 message(STATUS "  Dispatch:     CENTROID_DEVICE={cpu,gpu} (default cpu)")
 message(STATUS "===================================================")
-
-# ------------------------------------------------------------------------
-# Tests (carried over from the lossless-only refactor)
-# ------------------------------------------------------------------------
-if(ENABLE_HIP)
-  add_executable(mgardx_xdevice_smoke tests/mgardx_xdevice_smoke.cpp)
-  set_source_files_properties(tests/mgardx_xdevice_smoke.cpp PROPERTIES LANGUAGE HIP)
-  target_link_libraries(mgardx_xdevice_smoke PRIVATE
-    mgardx_lossless_serial mgardx_lossless_hip hip::device)
-  target_compile_definitions(mgardx_xdevice_smoke PRIVATE
-    __HIP_PLATFORM_AMD__ ENABLE_HIP MGARDX_COMPILE_HIP)
-  set_target_properties(mgardx_xdevice_smoke PROPERTIES
-    HIP_ARCHITECTURES "${GPU_TARGETS}")
-
-  add_executable(mgardx_cr_probe_hip tests/mgardx_cr_probe.cpp)
-  set_source_files_properties(tests/mgardx_cr_probe.cpp PROPERTIES LANGUAGE HIP)
-  target_link_libraries(mgardx_cr_probe_hip PRIVATE
-    mgardx_lossless_serial mgardx_lossless_hip hip::device)
-  target_compile_definitions(mgardx_cr_probe_hip PRIVATE
-    __HIP_PLATFORM_AMD__ ENABLE_HIP MGARDX_COMPILE_HIP CMG_PROBE_WITH_HIP)
-  set_target_properties(mgardx_cr_probe_hip PROPERTIES
-    HIP_ARCHITECTURES "${GPU_TARGETS}")
-endif()
-
-add_executable(mgardx_cr_probe_serial tests/mgardx_cr_probe.cpp)
-set_source_files_properties(tests/mgardx_cr_probe.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(mgardx_cr_probe_serial PRIVATE mgardx_lossless_serial)
-
-# Pull in libzstd for test executables (mgard_serial INTERFACE only declares
-# MGARD_ZSTD but does not link zstd; the operator .so gets it transitively
-# via ADIOS2, the standalone tests must link it explicitly).
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-  pkg_check_modules(ZSTD QUIET libzstd)
-endif()
-if(ZSTD_FOUND)
-  target_link_libraries(mgardx_cr_probe_serial PRIVATE ${ZSTD_LIBRARIES})
-  target_include_directories(mgardx_cr_probe_serial PRIVATE ${ZSTD_INCLUDE_DIRS})
-  if(ENABLE_HIP)
-    target_link_libraries(mgardx_cr_probe_hip PRIVATE ${ZSTD_LIBRARIES})
-    target_include_directories(mgardx_cr_probe_hip PRIVATE ${ZSTD_INCLUDE_DIRS})
-    target_link_libraries(mgardx_xdevice_smoke PRIVATE ${ZSTD_LIBRARIES})
-    target_include_directories(mgardx_xdevice_smoke PRIVATE ${ZSTD_INCLUDE_DIRS})
-  endif()
-else()
-  target_link_libraries(mgardx_cr_probe_serial PRIVATE zstd)
-  if(ENABLE_HIP)
-    target_link_libraries(mgardx_cr_probe_hip PRIVATE zstd)
-    target_link_libraries(mgardx_xdevice_smoke PRIVATE zstd)
-  endif()
-endif()

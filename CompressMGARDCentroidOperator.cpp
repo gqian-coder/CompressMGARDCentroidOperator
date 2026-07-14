@@ -21,9 +21,6 @@
 #include "CompressMGARDCentroidOperator.h"
 #include "MGARDXLossless.h"
 
-#include "adios2/core/Engine.h"
-#include "adios2/helper/adiosFunctions.h"
-
 #include <mgard/MGARDConfig.hpp>
 #include <mgard/compress_x.hpp>
 
@@ -54,6 +51,11 @@ constexpr uint8_t kBufferVersion = 5;
 constexpr uint8_t kResMarker_MGARD = 0;
 constexpr uint8_t kResMarker_MGARDX_Huff = 1;
 
+/* First byte of the 4-byte per-operator header. Matches the value the
+ * v1 (core::Operator-derived) interface wrote via MakeCommonHeader
+ * (OperatorType::PLUGIN_INTERFACE), so existing V5 files stay readable. */
+constexpr uint8_t kOperatorTypeByte = 53;
+
 /* ------ env-var helpers --------------------------------------------- */
 
 bool EnvIsOff(const std::string &s)
@@ -78,7 +80,11 @@ cmg_backend_t ChooseBackend()
         std::string s(e2);
         if (s == "HIP" || s == "CUDA") return CMG_BACKEND_HIP;
     }
+#ifdef CMG_HAVE_HIP
+    return CMG_BACKEND_HIP;
+#else
     return CMG_BACKEND_CPU;
+#endif
 }
 
 cmg_sfc_t ParseSFC(const Params &params)
@@ -135,17 +141,17 @@ const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
     }
     else if (g_meshFileName != meshFile || g_connVarName != connVar)
     {
-        helper::Throw<std::invalid_argument>(
-            "Operator", "CompressMGARDCentroidOperator", "LoadConnectivity",
+        throw std::invalid_argument(
+            "[CompressMGARDCentroidOperator::LoadConnectivity] "
             "Mesh-file/connectivity-variable cannot change between calls in the same process");
     }
     auto it = g_connCache.find(blockId);
     if (it != g_connCache.end()) return it->second;
     auto vConn = g_io_mesh.InquireVariable<int64_t>(connVar);
     if (!vConn)
-        helper::Throw<std::invalid_argument>(
-            "Operator", "CompressMGARDCentroidOperator", "LoadConnectivity",
-            "Connectivity variable '" + connVar + "' not found in " + meshFile);
+        throw std::invalid_argument(
+            "[CompressMGARDCentroidOperator::LoadConnectivity] Connectivity variable '" + connVar +
+            "' not found in " + meshFile);
     vConn.SetBlockSelection(blockId);
     std::vector<int64_t> conn;
     g_reader_mesh.Get<int64_t>(vConn, conn, adios2::Mode::Sync);
@@ -220,19 +226,16 @@ bool ResolveAndLoadCoords(const Params &params, const std::string &meshFile,
 
 mgard_x::data_type ToMgardType(DataType t)
 {
-    if (t == helper::GetDataType<float>())  return mgard_x::data_type::Float;
-    if (t == helper::GetDataType<double>()) return mgard_x::data_type::Double;
-    helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                         "ToMgardType", "Only float/double supported");
-    return mgard_x::data_type::Double;
+    if (t == DataType::Float)  return mgard_x::data_type::Float;
+    if (t == DataType::Double) return mgard_x::data_type::Double;
+    throw std::invalid_argument(
+        "[CompressMGARDCentroidOperator::ToMgardType] Only float/double supported");
 }
 size_t TypeNBytes(DataType t)
 {
-    if (t == helper::GetDataType<float>())  return sizeof(float);
-    if (t == helper::GetDataType<double>()) return sizeof(double);
-    helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                         "TypeNBytes", "Only float/double supported");
-    return 0;
+    if (t == DataType::Float || t == DataType::Double) return GetDataTypeSize(t);
+    throw std::invalid_argument(
+        "[CompressMGARDCentroidOperator::TypeNBytes] Only float/double supported");
 }
 
 mgard_x::Config MakeMgardConfig(cmg_backend_t be)
@@ -277,12 +280,23 @@ mgard_x::Config MakeMgardConfig(cmg_backend_t be)
 CompressMGARDCentroidOperator::CompressMGARDCentroidOperator(const Params &parameters)
 : PluginOperatorInterface(parameters)
 {
+    if (const char *e = std::getenv("CENTROID_VERBOSE")) m_Verbose = true;
     m_Backend = ChooseBackend();
-    if (m_Backend == CMG_BACKEND_HIP && !cmg_hip_available())
+    if (m_Backend == CMG_BACKEND_HIP)
     {
-        std::cerr << "[centroid] CENTROID_DEVICE=gpu requested but HIP backend not available; "
-                  << "falling back to CPU.\n";
-        m_Backend = CMG_BACKEND_CPU;
+        if (!cmg_hip_available())
+        {
+            std::cerr << "[centroid] CENTROID_DEVICE=gpu requested but HIP backend not available; "
+                    << "falling back to CPU.\n";
+            m_Backend = CMG_BACKEND_CPU;
+        }
+        if (m_Verbose)
+            std::cerr << "[centroid] CENTROID_DEVICE=gpu\n";
+    }
+    else
+    {
+        if (m_Verbose)
+            std::cerr << "[centroid] CENTROID_DEVICE=cpu\n";
     }
 }
 
@@ -293,10 +307,8 @@ CompressMGARDCentroidOperator::~CompressMGARDCentroidOperator()
 
 bool CompressMGARDCentroidOperator::IsDataTypeValid(const DataType type) const
 {
-    return (type == helper::GetDataType<float>() || type == helper::GetDataType<double>());
+    return (type == DataType::Float || type == DataType::Double);
 }
-
-size_t CompressMGARDCentroidOperator::GetHeaderSize() const { return headerSize; }
 
 size_t CompressMGARDCentroidOperator::GetEstimatedSize(const size_t ElemCount,
                                                        const size_t ElemSize,
@@ -327,22 +339,23 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     const auto t0 = high_resolution_clock::now();
 
     if (!IsDataTypeValid(type))
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                             "Operate", "Only float/double types are supported");
+        throw std::invalid_argument(
+            "[CompressMGARDCentroidOperator::Operate] Only float/double types are supported");
 
     /* ---- required params ---- */
     auto need = [&](const char *k) -> std::string {
         auto it = m_Parameters.find(k);
         if (it == m_Parameters.end())
-            helper::Throw<std::invalid_argument>(
-                "Operator", "CompressMGARDCentroidOperator", "Operate",
-                std::string("missing parameter '") + k + "'");
+            throw std::invalid_argument(
+                std::string("[CompressMGARDCentroidOperator::Operate] missing parameter '") + k +
+                "'");
         return it->second;
     };
+
     m_MeshFile         = need("meshfile");
     std::string connVar = need("connectivity_variable");
     m_NodesPerCell     = std::stoul(need("nodes_per_cell"));
-    m_BlockId          = helper::StringToSizeT(need("blockid"), "blockid");
+    m_BlockId          = std::stoul(need("blockid"));
 
     double tolerance = 0.0;
     bool   hasTol = false;
@@ -352,8 +365,8 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         if (it != m_Parameters.end()) { tolerance = std::stod(it->second); hasTol = true; }
     }
     if (!hasTol)
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                             "Operate", "missing mandatory parameter 'tolerance' (ABS)");
+        throw std::invalid_argument("[CompressMGARDCentroidOperator::Operate] missing mandatory "
+                                    "parameter 'tolerance' (ABS)");
 
     double ebratio = 0.8;
     {
@@ -361,14 +374,14 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         if (it != m_Parameters.end()) ebratio = std::stod(it->second);
     }
     if (ebratio <= 0.0 || ebratio >= 1.0)
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                             "Operate", "'ebratio' must be in (0, 1)");
+        throw std::invalid_argument(
+            "[CompressMGARDCentroidOperator::Operate] 'ebratio' must be in (0, 1)");
 
     {
         auto it = m_Parameters.find("mode");
         if (it != m_Parameters.end() && it->second != "ABS")
-            helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                                 "Operate", "Only 'ABS' mode is supported");
+            throw std::invalid_argument(
+                "[CompressMGARDCentroidOperator::Operate] Only 'ABS' mode is supported");
     }
     double s = 0.0;
     {
@@ -383,21 +396,19 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     const double tol_avg  = (1.0 - ebratio) * tolerance;
     const double tol_resi = ebratio * tolerance;
 
-    /* ---- shapes ---- */
-    const Dims convertedDims = ConvertDims(blockCount, type, 1);
-    if (convertedDims.size() != 1)
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                             "Operate", "expects a 1D nodal-array block");
-    const size_t nnodes    = convertedDims[0];
+    /* ---- shapes: treat the block as one flat 1D nodal array ---- */
+    const size_t nnodes    = GetTotalSize(blockCount);
     const size_t typeSize  = TypeNBytes(type);
     const size_t inputBytes = nnodes * typeSize;
 
     /* ---- write V5 header ---- */
     size_t off = 0;
-    MakeCommonHeader(bufferOut, off, kBufferVersion);
+    PutParameter(bufferOut, off, kOperatorTypeByte);
+    PutParameter(bufferOut, off, kBufferVersion);
+    PutParameter(bufferOut, off, (uint16_t)0); /* reserved */
     PutParameter(bufferOut, off, m_BlockId);
-    PutParameter(bufferOut, off, (size_t)convertedDims.size());
-    for (auto d : convertedDims) PutParameter(bufferOut, off, d);
+    PutParameter(bufferOut, off, (size_t)1); /* ndims: flattened to 1D */
+    PutParameter(bufferOut, off, nnodes);
     PutParameter(bufferOut, off, type);
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_MAJOR);
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_MINOR);
@@ -405,9 +416,13 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
 
     if (inputBytes < thresholdSize)
     {
+        /* Store the raw data inside our own payload. Returning 0 (the core
+         * "operator not applied" contract) does not work through the plugin
+         * wrapper: PluginOperator::Operate adds its own header and returns a
+         * nonzero size, so BP5 never takes its raw-copy fallback. */
         PutParameter(bufferOut, off, false);
-        headerSize = off;
-        return 0;
+        std::memcpy(bufferOut + off, dataIn, inputBytes);
+        return off + inputBytes;
     }
     PutParameter(bufferOut, off, true);
 
@@ -416,8 +431,8 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     const auto &conn = LoadConnectivity(m_MeshFile, connVar, m_BlockId);
     const auto t_conn1 = high_resolution_clock::now();
     if (conn.size() % m_NodesPerCell != 0)
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDCentroidOperator",
-                                             "Operate", "Connectivity length not a multiple of nodes_per_cell");
+        throw std::invalid_argument("[CompressMGARDCentroidOperator::Operate] Connectivity "
+                                    "length not a multiple of nodes_per_cell");
     const size_t ncells = conn.size() / m_NodesPerCell;
     PutParameter(bufferOut, off, ncells);
     PutParameter(bufferOut, off, m_NodesPerCell);
@@ -426,7 +441,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     std::vector<char> cellAvgBuf (ncells * typeSize);
     std::vector<char> residualBuf(nnodes * typeSize);
     const auto t_split0 = high_resolution_clock::now();
-    if (type == helper::GetDataType<float>())
+    if (type == DataType::Float)
     {
         cmg_centroid_split_f32(m_Backend,
             reinterpret_cast<const float *>(dataIn), conn.data(),
@@ -464,7 +479,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                                      cx, cy, cz, nnodes, want, perm.data());
 
         std::vector<char> sortedAvg(ncells * typeSize);
-        if (type == helper::GetDataType<float>())
+        if (type == DataType::Float)
             cmg_perm_forward_f32(reinterpret_cast<const float *>(cellAvgBuf.data()),
                                  reinterpret_cast<float *>(sortedAvg.data()),
                                  perm.data(), ncells);
@@ -494,16 +509,18 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                           mgardOut, mgardSize, cfg, false);
         if (mgardOut == nullptr || mgardSize == 0)
         {
-            std::cerr << "[centroid] mgard_x::compress returned empty buffer "
-                         "(n=" << n << " tol=" << tol << ")\n";
+            if (m_Verbose)
+                std::cerr << "[centroid] mgard_x::compress returned empty buffer "
+                             "(n=" << n << " tol=" << tol << ")\n";
             dstCap = 0;
             return;
         }
         if (mgardSize > dstCap)
         {
-            std::cerr << "[centroid] mgard_x output (" << mgardSize
-                      << " B) exceeds reserved capacity (" << dstCap
-                      << " B); aborting block.\n";
+            if (m_Verbose)
+                std::cerr << "[centroid] mgard_x output (" << mgardSize
+                          << " B) exceeds reserved capacity (" << dstCap
+                          << " B); aborting block.\n";
             std::free(mgardOut);
             dstCap = 0;
             return;
@@ -532,7 +549,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     /* quantize → host uint32 buffer */
     std::vector<uint32_t> quant(nnodes);
     const auto t_q0 = high_resolution_clock::now();
-    if (type == helper::GetDataType<float>())
+    if (type == DataType::Float)
         cmg_quantize_zigzag_f32(m_Backend, reinterpret_cast<const float *>(residualBuf.data()),
                                 nnodes, tol_resi, quant.data());
     else
@@ -560,14 +577,15 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         const auto t_ab1 = high_resolution_clock::now();
         const double ms_ser = duration<double, std::milli>(t_h1 - t_h0).count();
         const double ms_hip = duration<double, std::milli>(t_ab1 - t_ab0).count();
-        std::cerr << "[HUFF_AB] block=" << m_BlockId
-                  << " nnodes=" << nnodes
-                  << " tol_resi=" << tol_resi
-                  << " serial_bytes=" << cap_res
-                  << " hip_bytes=" << hip_bytes
-                  << " serial_ms=" << ms_ser
-                  << " hip_ms=" << ms_hip
-                  << "\n";
+        if (m_Verbose)
+            std::cerr << "[HUFF_AB] block=" << m_BlockId
+                    << " nnodes=" << nnodes
+                    << " tol_resi=" << tol_resi
+                    << " serial_bytes=" << cap_res
+                    << " hip_bytes=" << hip_bytes
+                    << " serial_ms=" << ms_ser
+                    << " hip_ms=" << ms_hip
+                    << "\n";
         if (const char *logp = std::getenv("CMG_HUFF_AB_LOG"); logp && *logp)
         {
             FILE *f = std::fopen(logp, "a");
@@ -586,8 +604,9 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     if (cap_res == 0)
     {
         /* fallback: MGARD-lossy on raw residual */
-        std::cerr << "[centroid] block=" << m_BlockId
-                  << " MGARD-X Huffman failed; falling back to MGARD on residual\n";
+        if (m_Verbose)
+            std::cerr << "[centroid] block=" << m_BlockId
+                      << " MGARD-X Huffman failed; falling back to MGARD on residual\n";
         actualResMarker = kResMarker_MGARD;
         /* rewind: marker byte stays, but our V5 reader trusts the byte we
          * write below. tol_resi field is unused for MGARD path; leave it.
@@ -603,19 +622,20 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     auto ms = [](auto a, auto b) {
         return duration<double, std::milli>(b - a).count();
     };
-    std::cerr << std::fixed << std::setprecision(2)
-              << "[centroid] block=" << m_BlockId
-              << " be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
-              << " in=" << inputBytes << " out=" << off
-              << " CR=" << (double)inputBytes / (double)off << "x"
-              << " (avg=" << cap_avg << "B res=" << cap_res << "B)"
-              << " ms[conn=" << ms(t_conn0, t_conn1)
-              << " split=" << ms(t_split0, t_split1)
-              << " sfc=" << ms(t_sfc0, t_sfc1)
-              << " mgard_avg=" << ms(t_avg0, t_avg1)
-              << " quant=" << ms(t_q0, t_q1)
-              << " huff=" << ms(t_h0, t_h1)
-              << " total=" << ms(t0, t1) << "]\n";
+    if (m_Verbose)
+        std::cerr << std::fixed << std::setprecision(2)
+                << "[centroid] block=" << m_BlockId
+                << " be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
+                << " in=" << inputBytes << " out=" << off
+                << " CR=" << (double)inputBytes / (double)off << "x"
+                << " (avg=" << cap_avg << "B res=" << cap_res << "B)"
+                << " ms[conn=" << ms(t_conn0, t_conn1)
+                << " split=" << ms(t_split0, t_split1)
+                << " sfc=" << ms(t_sfc0, t_sfc1)
+                << " mgard_avg=" << ms(t_avg0, t_avg1)
+                << " quant=" << ms(t_q0, t_q1)
+                << " huff=" << ms(t_h0, t_h1)
+                << " total=" << ms(t0, t1) << "]\n";
     return off;
 }
 
@@ -629,9 +649,10 @@ size_t CompressMGARDCentroidOperator::InverseOperate(const char *bufferIn, const
     const uint8_t bufferVersion = GetParameter<uint8_t>(bufferIn, off);
     off += 2;                                                   /* reserved */
     if (bufferVersion != kBufferVersion)
-        helper::Throw<std::runtime_error>("Operator", "CompressMGARDCentroidOperator",
-            "InverseOperate", "Unsupported buffer version " + std::to_string((int)bufferVersion) +
-            " (this build only reads V" + std::to_string((int)kBufferVersion) + ")");
+        throw std::runtime_error(
+            "[CompressMGARDCentroidOperator::InverseOperate] Unsupported buffer version " +
+            std::to_string((int)bufferVersion) + " (this build only reads V" +
+            std::to_string((int)kBufferVersion) + ")");
     return DecompressV5(bufferIn + off, sizeIn - off, dataOut);
 }
 
@@ -654,7 +675,12 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     const size_t nnodes   = blockCount[0];
     const size_t typeSize = TypeNBytes(type);
     const size_t sizeOut  = nnodes * typeSize;
-    if (!isCompressed) { headerSize += off; return 0; }
+    if (!isCompressed)
+    {
+        /* below-threshold block: raw data follows the header */
+        std::memcpy(dataOut, bufferIn + off, sizeOut);
+        return sizeOut;
+    }
 
     const size_t  ncells  = GetParameter<size_t>(bufferIn, off);
     const size_t  npc     = GetParameter<size_t>(bufferIn, off);
@@ -669,15 +695,14 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     auto itMesh = m_Parameters.find("meshfile");
     auto itConn = m_Parameters.find("connectivity_variable");
     if (itMesh == m_Parameters.end() || itConn == m_Parameters.end())
-        helper::Throw<std::invalid_argument>(
-            "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-            "Decompression requires meshfile + connectivity_variable params or "
-            "CENTROID_MESHFILE / CENTROID_CONN_VAR env vars");
+        throw std::invalid_argument(
+            "[CompressMGARDCentroidOperator::DecompressV5] Decompression requires meshfile + "
+            "connectivity_variable params or CENTROID_MESHFILE / CENTROID_CONN_VAR env vars");
     const auto &conn = LoadConnectivity(itMesh->second, itConn->second, blockId);
     if (conn.size() != ncells * npc)
-        helper::Throw<std::runtime_error>(
-            "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-            "Connectivity length mismatch on decompression for block " + std::to_string(blockId));
+        throw std::runtime_error(
+            "[CompressMGARDCentroidOperator::DecompressV5] Connectivity length mismatch on "
+            "decompression for block " + std::to_string(blockId));
 
     /* cell averages: MGARD decompress */
     const size_t cap_avg = GetParameter<size_t>(bufferIn, off);
@@ -701,10 +726,10 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     {
         std::vector<uint32_t> quant(nnodes);
         if (!mgardx_lossless::serial::Decompress(bufferIn + off, cap_res, nnodes, quant.data()))
-            helper::Throw<std::runtime_error>(
-                "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-                "MGARD-X Huffman decompression failed for block " + std::to_string(blockId));
-        if (type == helper::GetDataType<float>())
+            throw std::runtime_error(
+                "[CompressMGARDCentroidOperator::DecompressV5] MGARD-X Huffman decompression "
+                "failed for block " + std::to_string(blockId));
+        if (type == DataType::Float)
             cmg_dequantize_zigzag_f32(m_Backend, quant.data(), nnodes, tol_resi,
                                       reinterpret_cast<float *>(dataOut));
         else
@@ -713,9 +738,8 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     }
     else
     {
-        helper::Throw<std::runtime_error>(
-            "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-            "Unknown residual marker " + std::to_string((int)resMarker));
+        throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] Unknown residual "
+                                 "marker " + std::to_string((int)resMarker));
     }
     off += cap_res;
 
@@ -728,24 +752,23 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
             const bool ok = ResolveAndLoadCoords(m_Parameters, itMesh->second, itConn->second,
                                                  blockId, cx, cy, cz);
             if (!ok)
-                helper::Throw<std::runtime_error>(
-                    "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-                    "SFC mode requires coordinates; set CENTROID_COORD_PREFIX or coordinates_prefix");
+                throw std::runtime_error(
+                    "[CompressMGARDCentroidOperator::DecompressV5] SFC mode requires coordinates; "
+                    "set CENTROID_COORD_PREFIX or coordinates_prefix");
             auto vec = g_coordsCache.find({0, blockId});
             if (vec != g_coordsCache.end() && vec->second.size() != nnodes)
-                helper::Throw<std::runtime_error>(
-                    "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-                    "Coordinate length mismatch for block " + std::to_string(blockId));
+                throw std::runtime_error(
+                    "[CompressMGARDCentroidOperator::DecompressV5] Coordinate length mismatch "
+                    "for block " + std::to_string(blockId));
         }
         std::vector<uint32_t> perm(ncells);
         const cmg_sfc_t rebuilt = cmg_build_sfc_perm(m_Backend, conn.data(), ncells, npc,
                                                      cx, cy, cz, nnodes, sfcMode, perm.data());
         if (rebuilt != sfcMode)
-            helper::Throw<std::runtime_error>(
-                "Operator", "CompressMGARDCentroidOperator", "DecompressV5",
-                "Rebuilt SFC mode disagrees with bitstream marker");
+            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] Rebuilt SFC "
+                                     "mode disagrees with bitstream marker");
         std::vector<char> unsorted(ncells * typeSize);
-        if (type == helper::GetDataType<float>())
+        if (type == DataType::Float)
             cmg_perm_inverse_f32(reinterpret_cast<const float *>(avgOut),
                                  reinterpret_cast<float *>(unsorted.data()),
                                  perm.data(), ncells);
@@ -757,7 +780,7 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     }
 
     /* recombine bar_u(n) + r(n) → u(n) */
-    if (type == helper::GetDataType<float>())
+    if (type == DataType::Float)
         cmg_centroid_recombine_f32(m_Backend,
             reinterpret_cast<const float *>(avgOut), conn.data(),
             ncells, npc, nnodes, reinterpret_cast<float *>(dataOut));
