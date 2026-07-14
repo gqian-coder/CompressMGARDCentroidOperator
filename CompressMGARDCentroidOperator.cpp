@@ -130,7 +130,6 @@ const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
         try { g_io_mesh = g_ad.AtIO(ioName); }
         catch (...) {
             g_io_mesh = g_ad.DeclareIO(ioName);
-            g_io_mesh.SetParameter("SelectSteps", "0");
         }
         g_reader_mesh = g_io_mesh.Open(meshFile, adios2::Mode::ReadRandomAccess);
     }
