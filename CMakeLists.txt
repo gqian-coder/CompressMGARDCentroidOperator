@@ -76,6 +76,7 @@ set_target_properties(mgardx_lossless_serial PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
 if(ENABLE_HIP)
+  message(STATUS "HIP enabled ==> build mgardx_lossless_hip")
   add_library(mgardx_lossless_hip STATIC MGARDXLossless_HIP.cpp MGARDXLossless.h)
   set_source_files_properties(MGARDXLossless_HIP.cpp PROPERTIES LANGUAGE HIP)
   target_include_directories(mgardx_lossless_hip PUBLIC
@@ -104,6 +105,7 @@ if(ENABLE_HIP)
 endif()
 
 if(ENABLE_HIP)
+  message(STATUS "HIP enabled ==> build device_kernels_hip")
   add_library(device_kernels_hip STATIC
               DeviceKernels_HIP.cpp DeviceKernels.h)
   set_source_files_properties(DeviceKernels_HIP.cpp PROPERTIES LANGUAGE HIP)
@@ -123,7 +125,6 @@ endif()
 add_library(CompressMGARDCentroidOperator
             CompressMGARDCentroidOperator.cpp
             CompressMGARDCentroidOperator.h)
-set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE CXX)
 
 # adios2::cxx is the public C++ API used for the mesh reads; the v2 plugin
 # interface itself is header-only, so no link against internal adios2 targets.
@@ -132,12 +133,16 @@ target_link_libraries(CompressMGARDCentroidOperator
   PUBLIC  adios2::cxx)
 
 if(ENABLE_HIP)
+  message(STATUS "HIP enabled ==> build CompressMGARDCentroidOperator with HIP")
+  set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(CompressMGARDCentroidOperator
     PRIVATE device_kernels_hip mgardx_lossless_hip hip::device
     PUBLIC  mgard::mgard)
   target_compile_definitions(CompressMGARDCentroidOperator PRIVATE
     __HIP_PLATFORM_AMD__ ENABLE_HIP CMG_HAVE_HIP)
 else()
+  message(STATUS "CPU only ==> build CompressMGARDCentroidOperator CPU only")
+  set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE CXX)
   target_link_libraries(CompressMGARDCentroidOperator
     PUBLIC mgard_serial)
 endif()

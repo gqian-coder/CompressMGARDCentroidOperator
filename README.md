@@ -72,6 +72,12 @@ export CENTROID_DEVICE=cpu
 export MGARD_X_DEVICE_TYPE=SERIAL
 ```
 
+## To print information
+```bash
+export CENTROID_VERBOSE=1
+```
+
+By default the operator does not print anything. Logs go to stderr.
 
 ## Operator parameters
 

@@ -80,6 +80,7 @@ private:
     size_t      m_NodesPerCell = 0;
     size_t      m_BlockId = 0;
     cmg_backend_t m_Backend = CMG_BACKEND_CPU;
+    bool        m_Verbose = false;
 
     /* extra parameters injected by the engine */
     std::string m_EngineName;

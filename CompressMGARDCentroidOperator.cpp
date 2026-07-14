@@ -80,7 +80,11 @@ cmg_backend_t ChooseBackend()
         std::string s(e2);
         if (s == "HIP" || s == "CUDA") return CMG_BACKEND_HIP;
     }
+#ifdef CMG_HAVE_HIP
+    return CMG_BACKEND_HIP;
+#else
     return CMG_BACKEND_CPU;
+#endif
 }
 
 cmg_sfc_t ParseSFC(const Params &params)
@@ -277,12 +281,23 @@ mgard_x::Config MakeMgardConfig(cmg_backend_t be)
 CompressMGARDCentroidOperator::CompressMGARDCentroidOperator(const Params &parameters)
 : PluginOperatorInterface(parameters)
 {
+    if (const char *e = std::getenv("CENTROID_VERBOSE")) m_Verbose = true;
     m_Backend = ChooseBackend();
-    if (m_Backend == CMG_BACKEND_HIP && !cmg_hip_available())
+    if (m_Backend == CMG_BACKEND_HIP)
     {
-        std::cerr << "[centroid] CENTROID_DEVICE=gpu requested but HIP backend not available; "
-                  << "falling back to CPU.\n";
-        m_Backend = CMG_BACKEND_CPU;
+        if (!cmg_hip_available())
+        {
+            std::cerr << "[centroid] CENTROID_DEVICE=gpu requested but HIP backend not available; "
+                    << "falling back to CPU.\n";
+            m_Backend = CMG_BACKEND_CPU;
+        }
+        if (m_Verbose)
+            std::cerr << "[centroid] CENTROID_DEVICE=gpu\n";
+    }
+    else
+    {
+        if (m_Verbose)
+            std::cerr << "[centroid] CENTROID_DEVICE=cpu\n";
     }
 }
 
@@ -495,16 +510,18 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                           mgardOut, mgardSize, cfg, false);
         if (mgardOut == nullptr || mgardSize == 0)
         {
-            std::cerr << "[centroid] mgard_x::compress returned empty buffer "
-                         "(n=" << n << " tol=" << tol << ")\n";
+            if (m_Verbose)
+                std::cerr << "[centroid] mgard_x::compress returned empty buffer "
+                             "(n=" << n << " tol=" << tol << ")\n";
             dstCap = 0;
             return;
         }
         if (mgardSize > dstCap)
         {
-            std::cerr << "[centroid] mgard_x output (" << mgardSize
-                      << " B) exceeds reserved capacity (" << dstCap
-                      << " B); aborting block.\n";
+            if (m_Verbose)
+                std::cerr << "[centroid] mgard_x output (" << mgardSize
+                          << " B) exceeds reserved capacity (" << dstCap
+                          << " B); aborting block.\n";
             std::free(mgardOut);
             dstCap = 0;
             return;
@@ -561,14 +578,15 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         const auto t_ab1 = high_resolution_clock::now();
         const double ms_ser = duration<double, std::milli>(t_h1 - t_h0).count();
         const double ms_hip = duration<double, std::milli>(t_ab1 - t_ab0).count();
-        std::cerr << "[HUFF_AB] block=" << m_BlockId
-                  << " nnodes=" << nnodes
-                  << " tol_resi=" << tol_resi
-                  << " serial_bytes=" << cap_res
-                  << " hip_bytes=" << hip_bytes
-                  << " serial_ms=" << ms_ser
-                  << " hip_ms=" << ms_hip
-                  << "\n";
+        if (m_Verbose)
+            std::cerr << "[HUFF_AB] block=" << m_BlockId
+                    << " nnodes=" << nnodes
+                    << " tol_resi=" << tol_resi
+                    << " serial_bytes=" << cap_res
+                    << " hip_bytes=" << hip_bytes
+                    << " serial_ms=" << ms_ser
+                    << " hip_ms=" << ms_hip
+                    << "\n";
         if (const char *logp = std::getenv("CMG_HUFF_AB_LOG"); logp && *logp)
         {
             FILE *f = std::fopen(logp, "a");
@@ -587,8 +605,9 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     if (cap_res == 0)
     {
         /* fallback: MGARD-lossy on raw residual */
-        std::cerr << "[centroid] block=" << m_BlockId
-                  << " MGARD-X Huffman failed; falling back to MGARD on residual\n";
+        if (m_Verbose)
+            std::cerr << "[centroid] block=" << m_BlockId
+                      << " MGARD-X Huffman failed; falling back to MGARD on residual\n";
         actualResMarker = kResMarker_MGARD;
         /* rewind: marker byte stays, but our V5 reader trusts the byte we
          * write below. tol_resi field is unused for MGARD path; leave it.
@@ -604,19 +623,20 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     auto ms = [](auto a, auto b) {
         return duration<double, std::milli>(b - a).count();
     };
-    std::cerr << std::fixed << std::setprecision(2)
-              << "[centroid] block=" << m_BlockId
-              << " be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
-              << " in=" << inputBytes << " out=" << off
-              << " CR=" << (double)inputBytes / (double)off << "x"
-              << " (avg=" << cap_avg << "B res=" << cap_res << "B)"
-              << " ms[conn=" << ms(t_conn0, t_conn1)
-              << " split=" << ms(t_split0, t_split1)
-              << " sfc=" << ms(t_sfc0, t_sfc1)
-              << " mgard_avg=" << ms(t_avg0, t_avg1)
-              << " quant=" << ms(t_q0, t_q1)
-              << " huff=" << ms(t_h0, t_h1)
-              << " total=" << ms(t0, t1) << "]\n";
+    if (m_Verbose)
+        std::cerr << std::fixed << std::setprecision(2)
+                << "[centroid] block=" << m_BlockId
+                << " be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
+                << " in=" << inputBytes << " out=" << off
+                << " CR=" << (double)inputBytes / (double)off << "x"
+                << " (avg=" << cap_avg << "B res=" << cap_res << "B)"
+                << " ms[conn=" << ms(t_conn0, t_conn1)
+                << " split=" << ms(t_split0, t_split1)
+                << " sfc=" << ms(t_sfc0, t_sfc1)
+                << " mgard_avg=" << ms(t_avg0, t_avg1)
+                << " quant=" << ms(t_q0, t_q1)
+                << " huff=" << ms(t_h0, t_h1)
+                << " total=" << ms(t0, t1) << "]\n";
     return off;
 }
 
