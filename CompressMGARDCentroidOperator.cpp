@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -123,6 +124,12 @@ adios2::IO                                                  g_io_mesh;
 adios2::Engine                                              g_reader_mesh;
 std::map<size_t, std::vector<int64_t>>                      g_connCache;
 std::map<std::pair<int, size_t>, std::vector<double>>       g_coordsCache;
+/* SFC permutation cache: keyed by block id. The mesh (connectivity + coords) is
+ * time- and variable-invariant within a process, so the permutation is the same
+ * for every variable/timestep of a block; caching it avoids rebuilding the
+ * Hilbert sort on every (de)compress call. */
+std::map<size_t, std::vector<uint32_t>>                     g_permCache;
+std::map<size_t, cmg_sfc_t>                                 g_permMode;
 
 const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
                                              const std::string &connVar, size_t blockId)
@@ -222,6 +229,33 @@ bool ResolveAndLoadCoords(const Params &params, const std::string &meshFile,
     return true;
 }
 
+/* Build, or fetch from the per-process cache, the SFC permutation for a block.
+ * Cached by block id: connectivity + coordinates are invariant within a process,
+ * so a block's permutation is identical across all variables and timesteps. This
+ * turns O(vars * blocks) permutation builds into O(blocks). Used by both compress
+ * (forward reorder) and decompress (inverse reorder). */
+const std::vector<uint32_t> &GetOrBuildSFCPerm(cmg_backend_t be, size_t blockId,
+                                               cmg_sfc_t requested, const int64_t *conn,
+                                               size_t ncells, size_t npc, const double *cx,
+                                               const double *cy, const double *cz, size_t nnodes,
+                                               cmg_sfc_t &actualMode)
+{
+    std::lock_guard<std::mutex> lck(g_meshMutex);
+    auto it = g_permCache.find(blockId);
+    if (it != g_permCache.end())
+    {
+        actualMode = g_permMode[blockId];
+        return it->second;
+    }
+    std::vector<uint32_t> perm(ncells);
+    actualMode =
+        cmg_build_sfc_perm(be, conn, ncells, npc, cx, cy, cz, nnodes, requested, perm.data());
+    g_permMode[blockId] = actualMode;
+    auto &slot = g_permCache[blockId];
+    slot = std::move(perm);
+    return slot;
+}
+
 /* ------ MGARD compress helpers (cell averages) ---------------------- */
 
 mgard_x::data_type ToMgardType(DataType t)
@@ -238,12 +272,16 @@ size_t TypeNBytes(DataType t)
         "[CompressMGARDCentroidOperator::TypeNBytes] Only float/double supported");
 }
 
-mgard_x::Config MakeMgardConfig(cmg_backend_t be)
+mgard_x::Config MakeMgardConfig(cmg_backend_t /*be*/)
 {
     mgard_x::Config cfg;
     cfg.lossless = mgard_x::lossless_type::Huffman_Zstd;
-    cfg.dev_type = (be == CMG_BACKEND_HIP) ? mgard_x::device_type::HIP
-                                           : mgard_x::device_type::SERIAL;
+    /* Default the internal MGARD to SERIAL even when the centroid device kernels
+     * run on the GPU: MGARD here only compresses the small per-cell average
+     * array, for which CPU MGARD (no H2D/D2H or GPU workspace-rebuild overhead)
+     * is faster than HIP. Set MGARD_X_DEVICE_TYPE=HIP to override for a
+     * fully-GPU pipeline. */
+    cfg.dev_type = mgard_x::device_type::SERIAL;
     /* explicit override wins */
     if (const char *e = std::getenv("MGARD_X_DEVICE_TYPE"))
     {
@@ -280,7 +318,8 @@ mgard_x::Config MakeMgardConfig(cmg_backend_t be)
 CompressMGARDCentroidOperator::CompressMGARDCentroidOperator(const Params &parameters)
 : PluginOperatorInterface(parameters)
 {
-    if (const char *e = std::getenv("CENTROID_VERBOSE")) m_Verbose = true;
+    // Single env var gating all debug output from the centroid operator.
+    if (std::getenv("CENTROID_DEBUG")) m_Verbose = true;
     m_Backend = ChooseBackend();
     if (m_Backend == CMG_BACKEND_HIP)
     {
@@ -366,7 +405,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     }
     if (!hasTol)
         throw std::invalid_argument("[CompressMGARDCentroidOperator::Operate] missing mandatory "
-                                    "parameter 'tolerance' (ABS)");
+                                    "parameter 'tolerance' (relative)");
 
     double ebratio = 0.8;
     {
@@ -377,11 +416,26 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         throw std::invalid_argument(
             "[CompressMGARDCentroidOperator::Operate] 'ebratio' must be in (0, 1)");
 
+    /* Relative-tolerance mode: the input 'tolerance' is relative and is
+     * converted to an absolute tolerance by normalizing with a statistic of
+     * the data block (see below).
+     *   REL_L2  : normalize by the data L2 norm  = sqrt(sum x^2)
+     *   REL_VAL : normalize by the value range   = (max - min)             */
+    enum class RelMode { L2, VAL };
+    RelMode relMode = RelMode::L2; /* default */
     {
         auto it = m_Parameters.find("mode");
-        if (it != m_Parameters.end() && it->second != "ABS")
-            throw std::invalid_argument(
-                "[CompressMGARDCentroidOperator::Operate] Only 'ABS' mode is supported");
+        if (it != m_Parameters.end())
+        {
+            if (it->second == "REL_L2")
+                relMode = RelMode::L2;
+            else if (it->second == "REL_VAL")
+                relMode = RelMode::VAL;
+            else
+                throw std::invalid_argument(
+                    "[CompressMGARDCentroidOperator::Operate] Only 'REL_L2' and 'REL_VAL' "
+                    "mode is supported");
+        }
     }
     double s = 0.0;
     {
@@ -393,9 +447,6 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         auto it = m_Parameters.find("threshold");
         if (it != m_Parameters.end()) thresholdSize = std::stoul(it->second);
     }
-    const double tol_avg  = (1.0 - ebratio) * tolerance;
-    const double tol_resi = ebratio * tolerance;
-
     /* ---- shapes: treat the block as one flat 1D nodal array ---- */
     const size_t nnodes    = GetTotalSize(blockCount);
     const size_t typeSize  = TypeNBytes(type);
@@ -414,7 +465,32 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_MINOR);
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_PATCH);
 
-    if (inputBytes < thresholdSize)
+    /* ---- relative -> absolute tolerance ----
+     * Normalize the input relative 'tolerance' with a statistic of this data
+     * block; the min/max and sum-of-squares are computed on the GPU when the
+     * backend is HIP (else on the CPU). Only needed when we actually compress. */
+    double vmin = 0.0, vmax = 0.0, sumsq = 0.0;
+    if (inputBytes >= thresholdSize)
+    {
+        if (type == DataType::Float)
+            cmg_reduce_stats_f32(m_Backend, reinterpret_cast<const float *>(dataIn), nnodes,
+                                 &vmin, &vmax, &sumsq);
+        else
+            cmg_reduce_stats_f64(m_Backend, reinterpret_cast<const double *>(dataIn), nnodes,
+                                 &vmin, &vmax, &sumsq);
+    }
+    /* REL_L2 uses the RMS value sqrt((1/N) sum x^2) (the per-element "L2 norm"
+     * convention used by the driver and calc_err), so absTol is a per-element
+     * scale consistent with the L-inf residual quantizer. */
+    const double normFactor = (relMode == RelMode::L2)
+                                  ? std::sqrt(sumsq / static_cast<double>(nnodes))
+                                  : (vmax - vmin);
+    const double absTol = tolerance * normFactor;
+
+    /* Raw storage for tiny blocks or a degenerate normalization: a constant /
+     * all-zero block gives normFactor == 0 => absTol == 0, which would make the
+     * residual quantum 1/(2*absTol) non-finite. */
+    if (inputBytes < thresholdSize || !(absTol > 0.0))
     {
         /* Store the raw data inside our own payload. Returning 0 (the core
          * "operator not applied" contract) does not work through the plugin
@@ -425,6 +501,20 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         return off + inputBytes;
     }
     PutParameter(bufferOut, off, true);
+
+    /* Split the absolute error budget between the cell-average and the residual. */
+    const double tol_avg  = (1.0 - ebratio) * absTol;
+    const double tol_resi = ebratio * absTol;
+
+    if (m_Verbose)
+    {
+        const char *modeStr = (relMode == RelMode::L2) ? "REL_L2" : "REL_VAL";
+        std::cerr << std::scientific << std::setprecision(4) << "[centroid] block=" << m_BlockId
+                  << " mode=" << modeStr << " relTol=" << tolerance
+                  << (relMode == RelMode::L2 ? " rms=" : " range=") << normFactor
+                  << " abs_tol=" << absTol << " tol_avg=" << tol_avg << " tol_resi=" << tol_resi
+                  << std::endl;
+    }
 
     /* ---- connectivity ---- */
     const auto t_conn0 = high_resolution_clock::now();
@@ -474,9 +564,9 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                 cx = cy = cz = nullptr;
         }
         const cmg_sfc_t want = ParseSFC(m_Parameters);
-        std::vector<uint32_t> perm(ncells);
-        sfcMode = cmg_build_sfc_perm(m_Backend, conn.data(), ncells, m_NodesPerCell,
-                                     cx, cy, cz, nnodes, want, perm.data());
+        const std::vector<uint32_t> &perm =
+            GetOrBuildSFCPerm(m_Backend, m_BlockId, want, conn.data(), ncells, m_NodesPerCell, cx,
+                              cy, cz, nnodes, sfcMode);
 
         std::vector<char> sortedAvg(ncells * typeSize);
         if (type == DataType::Float)
@@ -659,6 +749,9 @@ size_t CompressMGARDCentroidOperator::InverseOperate(const char *bufferIn, const
 size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const size_t /*sizeIn*/,
                                                     char *dataOut)
 {
+    using namespace std::chrono;
+    auto ms = [](auto a, auto b) { return duration<double, std::milli>(b - a).count(); };
+    const auto t_start = high_resolution_clock::now();
     size_t off = 0;
     const size_t blockId = GetParameter<size_t>(bufferIn, off);
     const size_t ndims   = GetParameter<size_t, size_t>(bufferIn, off);
@@ -698,19 +791,26 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         throw std::invalid_argument(
             "[CompressMGARDCentroidOperator::DecompressV5] Decompression requires meshfile + "
             "connectivity_variable params or CENTROID_MESHFILE / CENTROID_CONN_VAR env vars");
+    const auto t_conn0 = high_resolution_clock::now();
     const auto &conn = LoadConnectivity(itMesh->second, itConn->second, blockId);
+    const auto t_conn1 = high_resolution_clock::now();
     if (conn.size() != ncells * npc)
         throw std::runtime_error(
             "[CompressMGARDCentroidOperator::DecompressV5] Connectivity length mismatch on "
             "decompression for block " + std::to_string(blockId));
 
-    /* cell averages: MGARD decompress */
+    /* cell averages: MGARD decompress (SERIAL by default, HIP via
+     * MGARD_X_DEVICE_TYPE -- same policy as compression). */
+    const mgard_x::Config avgCfg = MakeMgardConfig(m_Backend);
     const size_t cap_avg = GetParameter<size_t>(bufferIn, off);
     void *avgOut = nullptr;
-    mgard_x::decompress(bufferIn + off, cap_avg, avgOut, false);
+    const auto t_avg0 = high_resolution_clock::now();
+    mgard_x::decompress(bufferIn + off, cap_avg, avgOut, avgCfg, false);
+    const auto t_avg1 = high_resolution_clock::now();
     off += cap_avg;
 
     /* residual: marker-dispatched */
+    const auto t_res0 = high_resolution_clock::now();
     const uint8_t resMarker = GetParameter<uint8_t>(bufferIn, off);
     double tol_resi = 0.0;
     if (resMarker == kResMarker_MGARDX_Huff)
@@ -720,7 +820,7 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     if (resMarker == kResMarker_MGARD)
     {
         void *resiOut = dataOut;
-        mgard_x::decompress(bufferIn + off, cap_res, resiOut, true);
+        mgard_x::decompress(bufferIn + off, cap_res, resiOut, avgCfg, true);
     }
     else if (resMarker == kResMarker_MGARDX_Huff)
     {
@@ -742,8 +842,10 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
                                  "marker " + std::to_string((int)resMarker));
     }
     off += cap_res;
+    const auto t_res1 = high_resolution_clock::now();
 
     /* undo SFC permutation on cell averages */
+    const auto t_sfc0 = high_resolution_clock::now();
     if (sfcMode != CMG_SFC_NONE)
     {
         const double *cx = nullptr, *cy = nullptr, *cz = nullptr;
@@ -761,9 +863,9 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
                     "[CompressMGARDCentroidOperator::DecompressV5] Coordinate length mismatch "
                     "for block " + std::to_string(blockId));
         }
-        std::vector<uint32_t> perm(ncells);
-        const cmg_sfc_t rebuilt = cmg_build_sfc_perm(m_Backend, conn.data(), ncells, npc,
-                                                     cx, cy, cz, nnodes, sfcMode, perm.data());
+        cmg_sfc_t rebuilt;
+        const std::vector<uint32_t> &perm = GetOrBuildSFCPerm(
+            m_Backend, blockId, sfcMode, conn.data(), ncells, npc, cx, cy, cz, nnodes, rebuilt);
         if (rebuilt != sfcMode)
             throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] Rebuilt SFC "
                                      "mode disagrees with bitstream marker");
@@ -778,8 +880,10 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
                                  perm.data(), ncells);
         std::memcpy(avgOut, unsorted.data(), unsorted.size());
     }
+    const auto t_sfc1 = high_resolution_clock::now();
 
     /* recombine bar_u(n) + r(n) → u(n) */
+    const auto t_rec0 = high_resolution_clock::now();
     if (type == DataType::Float)
         cmg_centroid_recombine_f32(m_Backend,
             reinterpret_cast<const float *>(avgOut), conn.data(),
@@ -788,7 +892,19 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         cmg_centroid_recombine_f64(m_Backend,
             reinterpret_cast<const double *>(avgOut), conn.data(),
             ncells, npc, nnodes, reinterpret_cast<double *>(dataOut));
+    const auto t_rec1 = high_resolution_clock::now();
 
+    if (m_Verbose)
+        std::cerr << std::fixed << std::setprecision(2) << "[centroid] block=" << blockId
+                  << " decompress be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
+                  << " out=" << sizeOut << " ms[conn=" << ms(t_conn0, t_conn1)
+                  << " mgard_avg=" << ms(t_avg0, t_avg1) << " residual=" << ms(t_res0, t_res1)
+                  << " sfc=" << ms(t_sfc0, t_sfc1) << " recombine=" << ms(t_rec0, t_rec1)
+                  << " total=" << ms(t_start, high_resolution_clock::now()) << "]" << std::endl;
+
+    /* Release the MGARD-X cache so its (device) workspace is returned after each
+     * decompress, mirroring the release_cache on the compress side. */
+    mgard_x::release_cache(avgCfg);
     std::free(avgOut);
     return sizeOut;
 }

@@ -14,7 +14,7 @@ export LIBRARY_PATH=/opt/xpmem/lib64:${LIBRARY_PATH:-}
 source ~/frontier_model_to_load.sh
 
 ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios-cray
-MGARD_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD/install-hip-frontier
+MGARD_DIR=/ccs/proj/cfd164/mgard
 MGARD_SERIAL_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD-serial/install-serial
 ZSTD_LIB=${MGARD_DIR}/lib/libzstd.so
 

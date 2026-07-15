@@ -5,11 +5,18 @@
  * scheme for unstructured FE meshes. Single shared library; runtime CPU/GPU
  * dispatch via the CENTROID_DEVICE env var (or MGARD_X_DEVICE_TYPE).
  *
+ * The input 'tolerance' is RELATIVE; it is converted to an absolute tolerance
+ *   absTol = tolerance * norm(block)
+ * where norm is the data RMS value sqrt((1/N) sum x^2) (mode=REL_L2, the
+ * default; the per-element "L2 norm" convention used by the driver/calc_err) or
+ * the value range max-min (mode=REL_VAL). The min/max and sum-of-squares are
+ * computed on the GPU (HIP/CUDA) when the backend is a GPU. absTol is split below.
+ *
  * Encoder pipeline:
  *   1. Split          u(n) -> cell_avg(c)  +  residual(n)        [device kernel]
  *   2. SFC reorder    cell_avg sorted along a 3D Hilbert curve   [device kernel]
- *   3. MGARD compress cell_avg with tol_avg = (1-eb)*tolerance   [mgard-x]
- *   4. Quantize+zigzag residual with quantum = 2*tol_resi        [device kernel]
+ *   3. MGARD compress cell_avg with tol_avg = (1-eb)*absTol      [mgard-x]
+ *   4. Quantize+zigzag residual with quantum = 2*tol_resi, tol_resi = eb*absTol
  *   5. MGARD-X Huffman+ZSTD on the uint32 residual stream         [mgard-x]
  *
  * Bitstream version 5 (this file is the only writer):

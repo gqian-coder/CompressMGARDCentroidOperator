@@ -297,6 +297,79 @@ void dequantize_hip(const uint32_t *h_in, size_t n, double tol, T *h_out)
     hipFree(d_in); hipFree(d_out);
 }
 
+/* ---- reduction: min / max / sum-of-squares ------------------------- */
+
+template <typename T>
+__global__ void k_reduce_stats(const T *in, size_t n,
+                               double *blk_min, double *blk_max, double *blk_sumsq)
+{
+    __shared__ double s_min[BLOCK_X];
+    __shared__ double s_max[BLOCK_X];
+    __shared__ double s_sq[BLOCK_X];
+    const unsigned tid = threadIdx.x;
+    const size_t i0 = (size_t)blockIdx.x * blockDim.x + tid;
+    const size_t stride = (size_t)blockDim.x * gridDim.x;
+    /* Identity elements so threads with no work do not perturb the reduction. */
+    double vmin = 1.0e300, vmax = -1.0e300, ssq = 0.0;
+    for (size_t k = i0; k < n; k += stride) {
+        const double v = (double)in[k];
+        vmin = v < vmin ? v : vmin;
+        vmax = v > vmax ? v : vmax;
+        ssq += v * v;
+    }
+    s_min[tid] = vmin; s_max[tid] = vmax; s_sq[tid] = ssq;
+    __syncthreads();
+    for (unsigned s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_min[tid] = s_min[tid] < s_min[tid + s] ? s_min[tid] : s_min[tid + s];
+            s_max[tid] = s_max[tid] > s_max[tid + s] ? s_max[tid] : s_max[tid + s];
+            s_sq[tid] += s_sq[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        blk_min[blockIdx.x]   = s_min[0];
+        blk_max[blockIdx.x]   = s_max[0];
+        blk_sumsq[blockIdx.x] = s_sq[0];
+    }
+}
+
+template <typename T>
+void reduce_stats_hip(const T *h_in, size_t n,
+                      double *out_min, double *out_max, double *out_sumsq)
+{
+    if (n == 0) { *out_min = 0.0; *out_max = 0.0; *out_sumsq = 0.0; return; }
+    size_t nblk = grid(n);
+    if (nblk > 4096) nblk = 4096; /* grid-stride loop covers the remainder */
+
+    T *d_in = nullptr;
+    double *d_min = nullptr, *d_max = nullptr, *d_sq = nullptr;
+    HIP_OK(hipMalloc(&d_in, n * sizeof(T)));
+    HIP_OK(hipMalloc(&d_min, nblk * sizeof(double)));
+    HIP_OK(hipMalloc(&d_max, nblk * sizeof(double)));
+    HIP_OK(hipMalloc(&d_sq,  nblk * sizeof(double)));
+    HIP_OK(hipMemcpy(d_in, h_in, n * sizeof(T), hipMemcpyHostToDevice));
+
+    hipLaunchKernelGGL(k_reduce_stats<T>, dim3(nblk), dim3(BLOCK_X), 0, 0,
+                       d_in, n, d_min, d_max, d_sq);
+    HIP_OK(hipDeviceSynchronize());
+
+    std::vector<double> h_min(nblk), h_max(nblk), h_sq(nblk);
+    HIP_OK(hipMemcpy(h_min.data(), d_min, nblk * sizeof(double), hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(h_max.data(), d_max, nblk * sizeof(double), hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(h_sq.data(),  d_sq,  nblk * sizeof(double), hipMemcpyDeviceToHost));
+
+    double vmin = h_min[0], vmax = h_max[0], ssq = 0.0;
+    for (size_t i = 0; i < nblk; ++i) {
+        vmin = std::min(vmin, h_min[i]);
+        vmax = std::max(vmax, h_max[i]);
+        ssq += h_sq[i];
+    }
+    *out_min = vmin; *out_max = vmax; *out_sumsq = ssq;
+
+    hipFree(d_in); hipFree(d_min); hipFree(d_max); hipFree(d_sq);
+}
+
 } // namespace
 
 /* ========================== exported C ABI ========================== */
@@ -342,6 +415,13 @@ void cmg_hip_dequantize_zigzag_f32(const uint32_t *in, size_t n, double tol, flo
 { dequantize_hip<float>(in, n, tol, out); }
 void cmg_hip_dequantize_zigzag_f64(const uint32_t *in, size_t n, double tol, double *out)
 { dequantize_hip<double>(in, n, tol, out); }
+
+void cmg_hip_reduce_stats_f32(const float *in, size_t n,
+                              double *omin, double *omax, double *osumsq)
+{ reduce_stats_hip<float>(in, n, omin, omax, osumsq); }
+void cmg_hip_reduce_stats_f64(const double *in, size_t n,
+                              double *omin, double *omax, double *osumsq)
+{ reduce_stats_hip<double>(in, n, omin, omax, osumsq); }
 
 /* The SFC permutation builder runs centroid + code on device, then sorts on
  * host (sort overhead is small vs. centroid pass and avoids a thrust dep). */

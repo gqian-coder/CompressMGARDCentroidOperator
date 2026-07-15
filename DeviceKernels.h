@@ -104,6 +104,18 @@ void cmg_dequantize_zigzag_f32(cmg_backend_t be,
 void cmg_dequantize_zigzag_f64(cmg_backend_t be,
     const uint32_t *in_u32, size_t n, double tolerance, double *out);
 
+/* ------------------------------------------------------------------ */
+/* Block reduction for relative-tolerance normalization.               */
+/*   Computes the minimum, maximum, and sum-of-squares of the input    */
+/*   block in a single pass. The L2 norm is sqrt(out_sumsq); the value */
+/*   range is (out_max - out_min). Outputs are double for precision.   */
+/*   Runs on the GPU when be == CMG_BACKEND_HIP, else on the CPU.       */
+/* ------------------------------------------------------------------ */
+void cmg_reduce_stats_f32(cmg_backend_t be,
+    const float *in, size_t n, double *out_min, double *out_max, double *out_sumsq);
+void cmg_reduce_stats_f64(cmg_backend_t be,
+    const double *in, size_t n, double *out_min, double *out_max, double *out_sumsq);
+
 #ifdef __cplusplus
 }
 #endif

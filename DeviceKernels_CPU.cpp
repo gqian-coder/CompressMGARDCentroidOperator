@@ -175,6 +175,8 @@ void cmg_hip_dequantize_zigzag_f64(const uint32_t *, size_t, double, double *);
 cmg_sfc_t cmg_hip_build_sfc_perm(const int64_t *, size_t, size_t,
                                  const double *, const double *, const double *, size_t,
                                  cmg_sfc_t, uint32_t *);
+void cmg_hip_reduce_stats_f32(const float *, size_t, double *, double *, double *);
+void cmg_hip_reduce_stats_f64(const double *, size_t, double *, double *, double *);
 #endif
 
 void cmg_centroid_split_f32(cmg_backend_t be, const float *u, const int64_t *conn,
@@ -370,6 +372,49 @@ void cmg_dequantize_zigzag_f64(cmg_backend_t be, const uint32_t *in, size_t n,
 #endif
     const double q = 2.0 * tol;
     for (size_t i = 0; i < n; ++i) out[i] = static_cast<double>(zigzag_decode(in[i])) * q;
+}
+
+void cmg_reduce_stats_f32(cmg_backend_t be, const float *in, size_t n,
+                          double *out_min, double *out_max, double *out_sumsq)
+{
+#ifdef CMG_HAVE_HIP
+    if (be == CMG_BACKEND_HIP) {
+        cmg_hip_reduce_stats_f32(in, n, out_min, out_max, out_sumsq);
+        return;
+    }
+#else
+    (void)be;
+#endif
+    if (n == 0) { *out_min = 0.0; *out_max = 0.0; *out_sumsq = 0.0; return; }
+    double vmin = static_cast<double>(in[0]), vmax = vmin, ssq = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(in[i]);
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+        ssq += v * v;
+    }
+    *out_min = vmin; *out_max = vmax; *out_sumsq = ssq;
+}
+void cmg_reduce_stats_f64(cmg_backend_t be, const double *in, size_t n,
+                          double *out_min, double *out_max, double *out_sumsq)
+{
+#ifdef CMG_HAVE_HIP
+    if (be == CMG_BACKEND_HIP) {
+        cmg_hip_reduce_stats_f64(in, n, out_min, out_max, out_sumsq);
+        return;
+    }
+#else
+    (void)be;
+#endif
+    if (n == 0) { *out_min = 0.0; *out_max = 0.0; *out_sumsq = 0.0; return; }
+    double vmin = in[0], vmax = in[0], ssq = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double v = in[i];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+        ssq += v * v;
+    }
+    *out_min = vmin; *out_max = vmax; *out_sumsq = ssq;
 }
 
 /* HIP availability: HIP TU provides the strong definition; otherwise stub. */
