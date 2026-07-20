@@ -31,6 +31,11 @@ else()
   message(STATUS "Building CPU-only version (no GPU acceleration)")
 endif()
 
+#------------------------------------------------------------------------------#
+# Some boilerplate to setup nice output directories
+#------------------------------------------------------------------------------#
+include(GNUInstallDirs)
+
 find_package(ADIOS2 REQUIRED)
 if(ENABLE_HIP OR ENABLE_CUDA)
   find_package(MGARD REQUIRED)
