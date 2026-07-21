@@ -155,6 +155,22 @@ bool UseGroupCentroidPath(const Params &params)
     return v == "group_centroid" || v == "group" || v == "location";
 }
 
+/* Nodal SFC reorder of the RESIDUAL before entropy coding.
+ *
+ * Note this can only ever help the ZSTD/LZ stage: a Huffman code's length is
+ * fixed by the symbol frequencies, which a permutation cannot change. Measured
+ * benefit in the centroid path was ~1.5% (72 blocks), against a per-field
+ * gather on write plus a scatter on every read. Left ON by default to preserve
+ * behaviour, but switchable so the trade can be measured per dataset:
+ *   residual_sfc=off / CENTROID_RESID_SFC=0 */
+bool IsResidualSFCEnabled(const Params &params)
+{
+    auto it = params.find("residual_sfc");
+    if (it != params.end()) return !EnvIsOff(it->second);
+    if (const char *e = std::getenv("CENTROID_RESID_SFC")) return !EnvIsOff(std::string(e));
+    return true;
+}
+
 /* Residual backend selector: "huffman" (default) = quantize -> MGARD-X
  * Huffman/ZSTD; "mgard" = MGARD-lossy directly on the raw residual. Settable
  * via the residual_method parameter or MGARD_RESIDUAL_METHOD env var.
@@ -774,21 +790,24 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
          * timed separately from the per-field residual work. */
         cmg_sfc_t rSfc = CMG_SFC_NONE;
         const auto t_np0 = high_resolution_clock::now();
-        const std::vector<uint32_t> &nperm =
-            GetOrBuildNodeSFCPerm(m_Backend, m_BlockId, ParseSFC(m_Parameters), nx, ny, nz,
-                                  nnodes, rSfc);
-        const auto t_np1 = high_resolution_clock::now();
-        if (rSfc != CMG_SFC_NONE)
+        if (IsResidualSFCEnabled(m_Parameters))
         {
-            std::vector<char> tmp(nnodes * typeSize);
-            if (type == DataType::Float)
-                cmg_perm_forward_f32(reinterpret_cast<const float *>(resid.data()),
-                                     reinterpret_cast<float *>(tmp.data()), nperm.data(), nnodes);
-            else
-                cmg_perm_forward_f64(reinterpret_cast<const double *>(resid.data()),
-                                     reinterpret_cast<double *>(tmp.data()), nperm.data(), nnodes);
-            resid.swap(tmp);
+            const std::vector<uint32_t> &nperm =
+                GetOrBuildNodeSFCPerm(m_Backend, m_BlockId, ParseSFC(m_Parameters), nx, ny, nz,
+                                      nnodes, rSfc);
+            if (rSfc != CMG_SFC_NONE)
+            {
+                std::vector<char> tmp(nnodes * typeSize);
+                if (type == DataType::Float)
+                    cmg_perm_forward_f32(reinterpret_cast<const float *>(resid.data()),
+                                         reinterpret_cast<float *>(tmp.data()), nperm.data(), nnodes);
+                else
+                    cmg_perm_forward_f64(reinterpret_cast<const double *>(resid.data()),
+                                         reinterpret_cast<double *>(tmp.data()), nperm.data(), nnodes);
+                resid.swap(tmp);
+            }
         }
+        const auto t_np1 = high_resolution_clock::now();
         PutParameter(bufferOut, off, (uint8_t)rSfc);
         PutParameter(bufferOut, off, tol_resi);
 
