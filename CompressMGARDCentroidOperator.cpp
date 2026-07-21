@@ -184,32 +184,28 @@ bool IsResidualSFCEnabled(const Params &params)
  * tol_resi. The rms comes from cmg_reduce_stats_*, which runs on the GPU when
  * the backend is HIP. Disable with adaptive_residual=off /
  * CENTROID_ADAPTIVE_RESID=0. */
-/* Two criteria, both fed by the same cmg_reduce_stats_* call:
+/* Drop the residual when max|resid| <= tol_resi.
  *
- *   "linf" (default) : drop when max|resid| <= tol_resi. Every residual then
- *                      quantizes to zero, so the stored stream carries no
- *                      information and dropping it is PROVABLY output-identical
- *                      -- a free win, no accuracy change.
- *   "rms"            : drop when rms(resid) <= tol_resi. More aggressive: stays
- *                      inside the error budget but SPENDS the residual's whole
- *                      allocation, so delivered accuracy degrades toward the
- *                      bound (measured U_aver eb=1e-2: relL2 2.84e-3 -> 6.57e-3
- *                      for CR 73.6 -> 128.2).
- *   "off"            : never drop.
+ * The residual is quantized with quantum 2*tol_resi, so every value at or below
+ * tol_resi rounds to zero. If the maximum is below that threshold, the entire
+ * quantized stream is zeros and carries no information -- dropping it is
+ * PROVABLY output-identical, not a quality trade. Measured at eb=1e-2:
+ * P_aver CR 646.76 -> 1261.39 and Rho_ms 449.14 -> 540.66, both at bit-identical
+ * relL2; U_aver correctly declines (its max residual exceeds tol_resi).
  *
- * adaptive_residual= linf | rms | off   /  CENTROID_ADAPTIVE_RESID=... */
-enum class AdaptResid { Off, Linf, Rms };
-AdaptResid AdaptiveResidualMode(const Params &params)
+ * The statistic comes from cmg_reduce_stats_*, which runs on the GPU when the
+ * backend is HIP. Disable with adaptive_residual=off / CENTROID_ADAPTIVE_RESID=0.
+ *
+ * (An rms-based variant was evaluated and removed: the mean can sit below the
+ * threshold while individual values sit well above it, so it discards real
+ * information -- U_aver relL2 2.84e-3 -> 6.57e-3 -- and only stays legal by
+ * spending error budget the other paths leave unused.) */
+bool IsAdaptiveResidualEnabled(const Params &params)
 {
-    std::string v;
     auto it = params.find("adaptive_residual");
-    if (it != params.end()) v = it->second;
-    else if (const char *e = std::getenv("CENTROID_ADAPTIVE_RESID")) v = e;
-    for (auto &c : v) c = (char)std::tolower((unsigned char)c);
-    if (v.empty()) return AdaptResid::Linf;          /* default: the free rule */
-    if (v == "rms") return AdaptResid::Rms;
-    if (EnvIsOff(v)) return AdaptResid::Off;
-    return AdaptResid::Linf;                          /* "linf", "1", "on", ... */
+    if (it != params.end()) return !EnvIsOff(it->second);
+    if (const char *e = std::getenv("CENTROID_ADAPTIVE_RESID")) return !EnvIsOff(std::string(e));
+    return true;
 }
 
 /* Residual backend selector: "huffman" (default) = quantize -> MGARD-X
@@ -843,10 +839,8 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                                  nnodes, &rmin, &rmax, &rsumsq);
         const double residRms  = (nnodes > 0) ? std::sqrt(rsumsq / (double)nnodes) : 0.0;
         const double residLinf = std::max(std::fabs(rmin), std::fabs(rmax));
-        const AdaptResid arMode = AdaptiveResidualMode(m_Parameters);
         const bool dropResidual =
-            (arMode == AdaptResid::Linf && residLinf <= tol_resi) ||
-            (arMode == AdaptResid::Rms  && residRms  <= tol_resi);
+            IsAdaptiveResidualEnabled(m_Parameters) && residLinf <= tol_resi;
         const auto t_rms1 = high_resolution_clock::now();
 
         cmg_sfc_t rSfc = CMG_SFC_NONE;
