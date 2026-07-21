@@ -769,11 +769,15 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                                     reinterpret_cast<const double *>(dataIn),
                                     reinterpret_cast<double *>(resid.data()));
 
-        /* nodal SFC reorder of the residual (helps the ZSTD stage) */
+        /* nodal SFC reorder of the residual (helps the ZSTD stage).
+         * The permutation build is per-block geometry and cached, so it is
+         * timed separately from the per-field residual work. */
         cmg_sfc_t rSfc = CMG_SFC_NONE;
+        const auto t_np0 = high_resolution_clock::now();
         const std::vector<uint32_t> &nperm =
             GetOrBuildNodeSFCPerm(m_Backend, m_BlockId, ParseSFC(m_Parameters), nx, ny, nz,
                                   nnodes, rSfc);
+        const auto t_np1 = high_resolution_clock::now();
         if (rSfc != CMG_SFC_NONE)
         {
             std::vector<char> tmp(nnodes * typeSize);
@@ -813,10 +817,13 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                       << " in=" << inputBytes << " out=" << off
                       << " CR=" << (double)inputBytes / (double)off << "x"
                       << " (coarse=" << mgSize << "B resid=" << capR << "B)"
-                      << " ms[group=" << duration<double, std::milli>(t_grp1 - t_grp0).count()
+                      << " ms[groupbuild=" << duration<double, std::milli>(t_grp1 - t_grp0).count()
+                      << " nodepermbuild=" << duration<double, std::milli>(t_np1 - t_np0).count()
                       << " coarse=" << duration<double, std::milli>(t_co1 - t_co0).count()
                       << " mgard=" << duration<double, std::milli>(t_mg1 - t_mg0).count()
-                      << " resid=" << duration<double, std::milli>(t_rs1 - t_rs0).count() << "]\n";
+                      << " resid=" << (duration<double, std::milli>(t_rs1 - t_rs0).count() -
+                                       duration<double, std::milli>(t_np1 - t_np0).count())
+                      << "]\n";
         return off;
     }
 
