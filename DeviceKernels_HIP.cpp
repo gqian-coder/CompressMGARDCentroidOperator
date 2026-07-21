@@ -514,3 +514,68 @@ extern "C" cmg_sfc_t cmg_hip_build_sfc_perm(const int64_t *h_conn, size_t ncells
     for (size_t i = 0; i < ncells; ++i) perm_out[i] = idx[order[i]];
     return requested;
 }
+
+/* ------------------------------------------------------------------ */
+/* NODAL SFC permutation (GPU).                                        */
+/* Reuses k_sfc_codes directly on the node coordinates -- no cell      */
+/* centroid pass is needed since the points ARE the nodes.             */
+/* ------------------------------------------------------------------ */
+extern "C" cmg_sfc_t cmg_hip_build_sfc_perm_nodes(const double *X, const double *Y,
+                                                  const double *Z, size_t nnodes,
+                                                  cmg_sfc_t requested, uint32_t *perm_out)
+{
+    const bool wantCoord = (requested == CMG_SFC_MORTON || requested == CMG_SFC_HILBERT);
+    if (!(wantCoord && X && Y && Z) || nnodes == 0)
+    {
+        for (size_t i = 0; i < nnodes; ++i) perm_out[i] = (uint32_t)i;
+        return CMG_SFC_NONE;
+    }
+
+    double *d_X = nullptr, *d_Y = nullptr, *d_Z = nullptr;
+    uint64_t *d_codes = nullptr; uint32_t *d_idx = nullptr;
+    HIP_OK(hipMalloc(&d_X, nnodes * sizeof(double)));
+    HIP_OK(hipMalloc(&d_Y, nnodes * sizeof(double)));
+    HIP_OK(hipMalloc(&d_Z, nnodes * sizeof(double)));
+    HIP_OK(hipMalloc(&d_codes, nnodes * sizeof(uint64_t)));
+    HIP_OK(hipMalloc(&d_idx,   nnodes * sizeof(uint32_t)));
+    HIP_OK(hipMemcpy(d_X, X, nnodes * sizeof(double), hipMemcpyHostToDevice));
+    HIP_OK(hipMemcpy(d_Y, Y, nnodes * sizeof(double), hipMemcpyHostToDevice));
+    HIP_OK(hipMemcpy(d_Z, Z, nnodes * sizeof(double), hipMemcpyHostToDevice));
+
+    /* host-side bbox over node coords (single pass, cheap vs the sort) */
+    double xmin = X[0], xmax = X[0], ymin = Y[0], ymax = Y[0], zmin = Z[0], zmax = Z[0];
+    for (size_t i = 1; i < nnodes; ++i) {
+        if (X[i] < xmin) xmin = X[i]; if (X[i] > xmax) xmax = X[i];
+        if (Y[i] < ymin) ymin = Y[i]; if (Y[i] > ymax) ymax = Y[i];
+        if (Z[i] < zmin) zmin = Z[i]; if (Z[i] > zmax) zmax = Z[i];
+    }
+    const uint32_t maxQ = (1u << 21) - 1u;
+    const double sx = (xmax > xmin) ? double(maxQ) / (xmax - xmin) : 0.0;
+    const double sy = (ymax > ymin) ? double(maxQ) / (ymax - ymin) : 0.0;
+    const double sz = (zmax > zmin) ? double(maxQ) / (zmax - zmin) : 0.0;
+    const int useHilbert = (requested == CMG_SFC_HILBERT) ? 1 : 0;
+
+    hipLaunchKernelGGL(k_sfc_codes, dim3(grid(nnodes)), dim3(BLOCK_X), 0, 0,
+                       d_X, d_Y, d_Z, xmin, ymin, zmin, sx, sy, sz,
+                       maxQ, useHilbert, nnodes, d_codes, d_idx);
+    HIP_OK(hipDeviceSynchronize());
+
+    std::vector<uint64_t> codes(nnodes);
+    std::vector<uint32_t> idx(nnodes);
+    HIP_OK(hipMemcpy(codes.data(), d_codes, nnodes * sizeof(uint64_t), hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(idx.data(),   d_idx,   nnodes * sizeof(uint32_t), hipMemcpyDeviceToHost));
+    hipFree(d_X); hipFree(d_Y); hipFree(d_Z); hipFree(d_codes); hipFree(d_idx);
+
+    /* stable sort by (code, original node index) -- ties (coincident nodes)
+     * resolve deterministically so compress/decompress agree. */
+    std::vector<uint32_t> order(nnodes);
+    for (size_t i = 0; i < nnodes; ++i) order[i] = (uint32_t)i;
+    std::sort(order.begin(), order.end(),
+              [&](uint32_t a, uint32_t b) {
+                  return (codes[a] != codes[b]) ? (codes[a] < codes[b])
+                                                : (idx[a]   < idx[b]);
+              });
+    for (size_t i = 0; i < nnodes; ++i) perm_out[i] = idx[order[i]];
+    return requested;
+}
+

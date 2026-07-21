@@ -1,0 +1,8 @@
+# build + generated test outputs (multi-GB .bp trees)
+build*/
+nsfc_smoke/
+nsfc_test*/
+path_test/
+test_out/
+*.bp/
+*.log

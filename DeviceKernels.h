@@ -91,6 +91,30 @@ void cmg_perm_inverse_f32(const float  *src, float  *dst, const uint32_t *perm, 
 void cmg_perm_inverse_f64(const double *src, double *dst, const uint32_t *perm, size_t n);
 
 /* ------------------------------------------------------------------ */
+/* NODAL SFC permutation builder.                                      */
+/*                                                                     */
+/*   Orders the *nodes* (not the cells) along a space-filling curve    */
+/*   built directly from the node coordinates. Used by the             */
+/*   reorder+MGARD path to gather the nodal field into spatially       */
+/*   local order before handing it to MGARD's 1-D multilevel           */
+/*   transform (array-order neighbour correlation ~0.81 -> ~0.99).     */
+/*                                                                     */
+/*   On input  : X/Y/Z[nnodes] (required; no connectivity needed).     */
+/*   On output : perm_out[nnodes] s.t. perm[i] = original node at      */
+/*               slot i  (same convention as cmg_build_sfc_perm).      */
+/*   Returns the SFC kind actually used; returns CMG_SFC_NONE and      */
+/*   leaves perm as identity when coords are missing or `requested`    */
+/*   is not a coordinate-based curve.                                  */
+/*                                                                     */
+/*   Pair with cmg_perm_forward_* (compress) / cmg_perm_inverse_*      */
+/*   (decompress) for the gather/scatter.                              */
+/* ------------------------------------------------------------------ */
+cmg_sfc_t cmg_build_sfc_perm_nodes(cmg_backend_t be,
+    const double *X, const double *Y, const double *Z, size_t nnodes,
+    cmg_sfc_t requested,
+    uint32_t *perm_out);
+
+/* ------------------------------------------------------------------ */
 /* Linear quantization (mid-tread, quantum = 2*tolerance) + zigzag.    */
 /*   Output is uint32_t suitable for MGARD-X Huffman+ZSTD.             */
 /* ------------------------------------------------------------------ */

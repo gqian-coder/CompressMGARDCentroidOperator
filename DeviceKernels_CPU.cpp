@@ -175,6 +175,8 @@ void cmg_hip_dequantize_zigzag_f64(const uint32_t *, size_t, double, double *);
 cmg_sfc_t cmg_hip_build_sfc_perm(const int64_t *, size_t, size_t,
                                  const double *, const double *, const double *, size_t,
                                  cmg_sfc_t, uint32_t *);
+cmg_sfc_t cmg_hip_build_sfc_perm_nodes(const double *, const double *, const double *,
+                                       size_t, cmg_sfc_t, uint32_t *);
 void cmg_hip_reduce_stats_f32(const float *, size_t, double *, double *, double *);
 void cmg_hip_reduce_stats_f64(const double *, size_t, double *, double *, double *);
 #endif
@@ -328,6 +330,61 @@ void cmg_perm_inverse_f32(const float  *s, float  *d, const uint32_t *p, size_t 
 { for (size_t i = 0; i < n; ++i) d[p[i]] = s[i]; }
 void cmg_perm_inverse_f64(const double *s, double *d, const uint32_t *p, size_t n)
 { for (size_t i = 0; i < n; ++i) d[p[i]] = s[i]; }
+
+/* ------------------------------------------------------------------ */
+/* NODAL SFC permutation: order the nodes themselves along the curve.  */
+/* ------------------------------------------------------------------ */
+cmg_sfc_t cmg_build_sfc_perm_nodes(cmg_backend_t be,
+                                   const double *X, const double *Y, const double *Z,
+                                   size_t nnodes, cmg_sfc_t requested, uint32_t *perm_out)
+{
+#ifdef CMG_HAVE_HIP
+    if (be == CMG_BACKEND_HIP) {
+        return cmg_hip_build_sfc_perm_nodes(X, Y, Z, nnodes, requested, perm_out);
+    }
+#else
+    (void)be;
+#endif
+    const bool wantCoord = (requested == CMG_SFC_MORTON || requested == CMG_SFC_HILBERT);
+    if (!(wantCoord && X && Y && Z) || nnodes == 0)
+    {
+        for (size_t i = 0; i < nnodes; ++i) perm_out[i] = (uint32_t)i;
+        return CMG_SFC_NONE;
+    }
+    double xmin = X[0], xmax = X[0], ymin = Y[0], ymax = Y[0], zmin = Z[0], zmax = Z[0];
+    for (size_t i = 1; i < nnodes; ++i) {
+        if (X[i] < xmin) xmin = X[i]; if (X[i] > xmax) xmax = X[i];
+        if (Y[i] < ymin) ymin = Y[i]; if (Y[i] > ymax) ymax = Y[i];
+        if (Z[i] < zmin) zmin = Z[i]; if (Z[i] > zmax) zmax = Z[i];
+    }
+    const uint32_t maxQ = (1u << 21) - 1u;
+    const double sx = (xmax > xmin) ? double(maxQ) / (xmax - xmin) : 0.0;
+    const double sy = (ymax > ymin) ? double(maxQ) / (ymax - ymin) : 0.0;
+    const double sz = (zmax > zmin) ? double(maxQ) / (zmax - zmin) : 0.0;
+
+    std::vector<std::pair<uint64_t, uint32_t>> kv(nnodes);
+    for (size_t i = 0; i < nnodes; ++i)
+    {
+        double qxd = (X[i] - xmin) * sx;
+        double qyd = (Y[i] - ymin) * sy;
+        double qzd = (Z[i] - zmin) * sz;
+        if (qxd < 0.0) qxd = 0.0; if (qxd > double(maxQ)) qxd = maxQ;
+        if (qyd < 0.0) qyd = 0.0; if (qyd > double(maxQ)) qyd = maxQ;
+        if (qzd < 0.0) qzd = 0.0; if (qzd > double(maxQ)) qzd = maxQ;
+        const uint32_t qx = (uint32_t)qxd, qy = (uint32_t)qyd, qz = (uint32_t)qzd;
+        kv[i] = { (requested == CMG_SFC_HILBERT) ? hilbert3d(qx, qy, qz)
+                                                 : morton3d(qx, qy, qz),
+                  (uint32_t)i };
+    }
+    /* ties (coincident nodes) break on original index -> deterministic */
+    std::sort(kv.begin(), kv.end(),
+              [](const auto &a, const auto &b) {
+                  return (a.first != b.first) ? (a.first < b.first) : (a.second < b.second);
+              });
+    for (size_t i = 0; i < nnodes; ++i) perm_out[i] = kv[i].second;
+    return requested;
+}
+
 
 void cmg_quantize_zigzag_f32(cmg_backend_t be, const float *in, size_t n,
                               double tol, uint32_t *out)
