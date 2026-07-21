@@ -171,6 +171,47 @@ bool IsResidualSFCEnabled(const Params &params)
     return true;
 }
 
+/* Adaptive no-residual rule (group_centroid).
+ *
+ * The residual is only worth storing if it carries information above the
+ * quantization floor. When the coarse (group-mean) reconstruction is already
+ * inside the residual's slice of the error budget, the quantizer maps every
+ * residual to zero and the encoded stream is pure overhead -- measured at
+ * eb=1e-2 for P_aver: 38,572 B (49% of the output) spent encoding an all-zero
+ * array, because rms(residual)=13 against a quantum of 2350.
+ *
+ * So: compute rms(u - coarse[group]) and drop the residual when it is within
+ * tol_resi. The rms comes from cmg_reduce_stats_*, which runs on the GPU when
+ * the backend is HIP. Disable with adaptive_residual=off /
+ * CENTROID_ADAPTIVE_RESID=0. */
+/* Two criteria, both fed by the same cmg_reduce_stats_* call:
+ *
+ *   "linf" (default) : drop when max|resid| <= tol_resi. Every residual then
+ *                      quantizes to zero, so the stored stream carries no
+ *                      information and dropping it is PROVABLY output-identical
+ *                      -- a free win, no accuracy change.
+ *   "rms"            : drop when rms(resid) <= tol_resi. More aggressive: stays
+ *                      inside the error budget but SPENDS the residual's whole
+ *                      allocation, so delivered accuracy degrades toward the
+ *                      bound (measured U_aver eb=1e-2: relL2 2.84e-3 -> 6.57e-3
+ *                      for CR 73.6 -> 128.2).
+ *   "off"            : never drop.
+ *
+ * adaptive_residual= linf | rms | off   /  CENTROID_ADAPTIVE_RESID=... */
+enum class AdaptResid { Off, Linf, Rms };
+AdaptResid AdaptiveResidualMode(const Params &params)
+{
+    std::string v;
+    auto it = params.find("adaptive_residual");
+    if (it != params.end()) v = it->second;
+    else if (const char *e = std::getenv("CENTROID_ADAPTIVE_RESID")) v = e;
+    for (auto &c : v) c = (char)std::tolower((unsigned char)c);
+    if (v.empty()) return AdaptResid::Linf;          /* default: the free rule */
+    if (v == "rms") return AdaptResid::Rms;
+    if (EnvIsOff(v)) return AdaptResid::Off;
+    return AdaptResid::Linf;                          /* "linf", "1", "on", ... */
+}
+
 /* Residual backend selector: "huffman" (default) = quantize -> MGARD-X
  * Huffman/ZSTD; "mgard" = MGARD-lossy directly on the raw residual. Settable
  * via the residual_method parameter or MGARD_RESIDUAL_METHOD env var.
@@ -788,42 +829,72 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         /* nodal SFC reorder of the residual (helps the ZSTD stage).
          * The permutation build is per-block geometry and cached, so it is
          * timed separately from the per-field residual work. */
+        /* --- adaptive rule: is the residual worth storing at all? ---
+         * rms via cmg_reduce_stats_*, which runs on the GPU when m_Backend is
+         * HIP. Evaluated BEFORE the SFC gather so a dropped residual also skips
+         * that work. */
+        const auto t_rms0 = high_resolution_clock::now();
+        double rmin = 0.0, rmax = 0.0, rsumsq = 0.0;
+        if (type == DataType::Float)
+            cmg_reduce_stats_f32(m_Backend, reinterpret_cast<const float *>(resid.data()),
+                                 nnodes, &rmin, &rmax, &rsumsq);
+        else
+            cmg_reduce_stats_f64(m_Backend, reinterpret_cast<const double *>(resid.data()),
+                                 nnodes, &rmin, &rmax, &rsumsq);
+        const double residRms  = (nnodes > 0) ? std::sqrt(rsumsq / (double)nnodes) : 0.0;
+        const double residLinf = std::max(std::fabs(rmin), std::fabs(rmax));
+        const AdaptResid arMode = AdaptiveResidualMode(m_Parameters);
+        const bool dropResidual =
+            (arMode == AdaptResid::Linf && residLinf <= tol_resi) ||
+            (arMode == AdaptResid::Rms  && residRms  <= tol_resi);
+        const auto t_rms1 = high_resolution_clock::now();
+
         cmg_sfc_t rSfc = CMG_SFC_NONE;
-        const auto t_np0 = high_resolution_clock::now();
-        if (IsResidualSFCEnabled(m_Parameters))
+        auto t_np0 = high_resolution_clock::now();
+        auto t_np1 = t_np0, t_gat0 = t_np0, t_gat1 = t_np0;
+        if (!dropResidual && IsResidualSFCEnabled(m_Parameters))
         {
+            t_np0 = high_resolution_clock::now();
             const std::vector<uint32_t> &nperm =
                 GetOrBuildNodeSFCPerm(m_Backend, m_BlockId, ParseSFC(m_Parameters), nx, ny, nz,
                                       nnodes, rSfc);
+            t_np1 = high_resolution_clock::now();
             if (rSfc != CMG_SFC_NONE)
             {
                 std::vector<char> tmp(nnodes * typeSize);
+                t_gat0 = high_resolution_clock::now();
                 if (type == DataType::Float)
                     cmg_perm_forward_f32(reinterpret_cast<const float *>(resid.data()),
                                          reinterpret_cast<float *>(tmp.data()), nperm.data(), nnodes);
                 else
                     cmg_perm_forward_f64(reinterpret_cast<const double *>(resid.data()),
                                          reinterpret_cast<double *>(tmp.data()), nperm.data(), nnodes);
+                t_gat1 = high_resolution_clock::now();
                 resid.swap(tmp);
             }
         }
-        const auto t_np1 = high_resolution_clock::now();
         PutParameter(bufferOut, off, (uint8_t)rSfc);
         PutParameter(bufferOut, off, tol_resi);
 
-        std::vector<uint32_t> quantC(nnodes);
-        if (type == DataType::Float)
-            cmg_quantize_zigzag_f32(m_Backend, reinterpret_cast<const float *>(resid.data()),
-                                    nnodes, tol_resi, quantC.data());
-        else
-            cmg_quantize_zigzag_f64(m_Backend, reinterpret_cast<const double *>(resid.data()),
-                                    nnodes, tol_resi, quantC.data());
-        char *outR = bufferOut + off + sizeof(size_t);
-        size_t capR = mgardx_lossless::serial::Compress(quantC.data(), nnodes, outR,
-                                                        nnodes * sizeof(uint32_t) * 4 + 4096);
-        if (capR == 0)
-            throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
-                                     "residual entropy coding failed");
+        /* capR == 0 marks "no residual stored"; the decoder reconstructs from
+         * the coarse stream alone. */
+        size_t capR = 0;
+        if (!dropResidual)
+        {
+            std::vector<uint32_t> quantC(nnodes);
+            if (type == DataType::Float)
+                cmg_quantize_zigzag_f32(m_Backend, reinterpret_cast<const float *>(resid.data()),
+                                        nnodes, tol_resi, quantC.data());
+            else
+                cmg_quantize_zigzag_f64(m_Backend, reinterpret_cast<const double *>(resid.data()),
+                                        nnodes, tol_resi, quantC.data());
+            char *outR = bufferOut + off + sizeof(size_t);
+            capR = mgardx_lossless::serial::Compress(quantC.data(), nnodes, outR,
+                                                     nnodes * sizeof(uint32_t) * 4 + 4096);
+            if (capR == 0)
+                throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
+                                         "residual entropy coding failed");
+        }
         PutParameter(bufferOut, off, capR);
         off += capR;
         const auto t_rs1 = high_resolution_clock::now();
@@ -836,12 +907,19 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                       << " in=" << inputBytes << " out=" << off
                       << " CR=" << (double)inputBytes / (double)off << "x"
                       << " (coarse=" << mgSize << "B resid=" << capR << "B)"
+                      << (dropResidual ? " NO-RESIDUAL" : "")
+                      << " residRms=" << residRms << " residLinf=" << residLinf
+                      << " tol_resi=" << tol_resi
                       << " ms[groupbuild=" << duration<double, std::milli>(t_grp1 - t_grp0).count()
                       << " nodepermbuild=" << duration<double, std::milli>(t_np1 - t_np0).count()
+                      << " gather=" << duration<double, std::milli>(t_gat1 - t_gat0).count()
+                      << " rms=" << duration<double, std::milli>(t_rms1 - t_rms0).count()
                       << " coarse=" << duration<double, std::milli>(t_co1 - t_co0).count()
                       << " mgard=" << duration<double, std::milli>(t_mg1 - t_mg0).count()
                       << " resid=" << (duration<double, std::milli>(t_rs1 - t_rs0).count() -
-                                       duration<double, std::milli>(t_np1 - t_np0).count())
+                                       duration<double, std::milli>(t_np1 - t_np0).count() -
+                                       duration<double, std::milli>(t_gat1 - t_gat0).count() -
+                                       duration<double, std::milli>(t_rms1 - t_rms0).count())
                       << "]\n";
         return off;
     }
@@ -1292,6 +1370,20 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         const cmg_sfc_t rSfc = (cmg_sfc_t)rSfcRaw;
         const double tolR = GetParameter<double>(bufferIn, off);
         const size_t capR = GetParameter<size_t>(bufferIn, off);
+        /* capR == 0: the encoder dropped the residual (adaptive rule) -- the
+         * coarse stream alone was already inside the residual error budget. */
+        if (capR == 0)
+        {
+            std::memset(dataOut, 0, nnodes * typeSize);
+            if (type == DataType::Float)
+                cmg_group_bcast_add_f32(reinterpret_cast<const float *>(coarseNat.data()),
+                                        cg.gid.data(), nnodes, reinterpret_cast<float *>(dataOut));
+            else
+                cmg_group_bcast_add_f64(reinterpret_cast<const double *>(coarseNat.data()),
+                                        cg.gid.data(), nnodes, reinterpret_cast<double *>(dataOut));
+            return sizeOut;
+        }
+
         std::vector<uint32_t> quantC(nnodes);
         if (!mgardx_lossless::serial::Decompress(bufferIn + off, capR, nnodes, quantC.data()))
             throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
