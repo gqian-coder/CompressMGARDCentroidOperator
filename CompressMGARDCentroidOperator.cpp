@@ -127,16 +127,32 @@ bool IsSFCEnabled(const Params &params)
  *                          separation instead.
  *
  * Select with the "method" parameter or CENTROID_METHOD env var. */
+std::string MethodName(const Params &params)
+{
+    std::string v;
+    auto it = params.find("method");
+    if (it != params.end()) v = it->second;
+    else if (const char *e = std::getenv("CENTROID_METHOD")) v = e;
+    for (auto &c : v) c = (char)std::tolower((unsigned char)c);
+    return v;
+}
+
 bool UseReorderMgardPath(const Params &params)
 {
-    auto pick = [](std::string v) {
-        for (auto &c : v) c = (char)std::tolower((unsigned char)c);
-        return v == "reorder_mgard" || v == "sfc_mgard" || v == "reorder";
-    };
-    auto it = params.find("method");
-    if (it != params.end()) return pick(it->second);
-    if (const char *e = std::getenv("CENTROID_METHOD")) return pick(std::string(e));
-    return false;
+    const std::string v = MethodName(params);
+    return v == "reorder_mgard" || v == "sfc_mgard" || v == "reorder";
+}
+
+/* method=group_centroid : coarse stream is one value per DISTINCT COORDINATE
+ * LOCATION (this mesh stores each location 12.7x-23.3x over, so the coarse
+ * stream is ~6.6% of nnodes), SFC-reordered over the group locations and
+ * MGARD-compressed; the per-node residual u - coarse[group(n)] is nodal-SFC
+ * reordered, quantized and entropy coded. The grouping is derived from the
+ * coordinates alone, so it is cached per block and stored in zero bytes. */
+bool UseGroupCentroidPath(const Params &params)
+{
+    const std::string v = MethodName(params);
+    return v == "group_centroid" || v == "group" || v == "location";
 }
 
 /* Residual backend selector: "huffman" (default) = quantize -> MGARD-X
@@ -178,6 +194,17 @@ std::map<size_t, cmg_sfc_t>                                 g_permMode;
  * and timestep of a block. */
 std::map<size_t, std::vector<uint32_t>>                     g_nodePermCache;
 std::map<size_t, cmg_sfc_t>                                 g_nodePermMode;
+/* Coordinate-group cache (group_centroid path): gid per node, the group count,
+ * and the SFC permutation over the group locations. All geometry-derived, so
+ * identical for every variable/timestep of a block and never stored. */
+struct CoordGroups
+{
+    std::vector<uint32_t> gid;        /* [nnodes] -> group id                 */
+    size_t                ngroups = 0;
+    std::vector<uint32_t> gperm;      /* [ngroups] SFC order over groups      */
+    cmg_sfc_t             gmode = CMG_SFC_NONE;
+};
+std::map<size_t, CoordGroups>                               g_groupCache;
 
 const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
                                              const std::string &connVar, size_t blockId)
@@ -330,6 +357,31 @@ const std::vector<uint32_t> &GetOrBuildNodeSFCPerm(cmg_backend_t be, size_t bloc
     return slot;
 }
 
+
+/* Build, or fetch from cache, the coordinate grouping for a block plus an SFC
+ * permutation over the group locations. Geometry-only: identical for every
+ * variable and timestep, and re-derived on read, so it costs no stored bytes. */
+const CoordGroups &GetOrBuildCoordGroups(cmg_backend_t be, size_t blockId,
+                                         cmg_sfc_t requested, const double *X,
+                                         const double *Y, const double *Z, size_t nnodes)
+{
+    std::lock_guard<std::mutex> lck(g_meshMutex);
+    auto it = g_groupCache.find(blockId);
+    if (it != g_groupCache.end()) return it->second;
+
+    CoordGroups cg;
+    cg.gid.resize(nnodes);
+    std::vector<double> gx(nnodes), gy(nnodes), gz(nnodes);   /* upper bound */
+    cg.ngroups = cmg_build_coord_groups(be, X, Y, Z, nnodes, cg.gid.data(),
+                                        gx.data(), gy.data(), gz.data());
+    gx.resize(cg.ngroups); gy.resize(cg.ngroups); gz.resize(cg.ngroups);
+    cg.gperm.resize(cg.ngroups);
+    cg.gmode = cmg_build_sfc_perm_nodes(be, gx.data(), gy.data(), gz.data(), cg.ngroups,
+                                        requested, cg.gperm.data());
+    auto &slot = g_groupCache[blockId];
+    slot = std::move(cg);
+    return slot;
+}
 
 /* ------ MGARD compress helpers (cell averages) ---------------------- */
 
@@ -589,6 +641,183 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                   << (relMode == RelMode::L2 ? " rms=" : " range=") << normFactor
                   << " abs_tol=" << absTol << " tol_avg=" << tol_avg << " tol_resi=" << tol_resi
                   << std::endl;
+    }
+
+    /* =================================================================
+     * PATH C: group-location decomposition (method=group_centroid).
+     *
+     *   coarse[g] = mean of u over the nodes sharing location g
+     *               -> SFC reorder over group locations -> MGARD
+     *   resid[n]  = u[n] - coarse[group(n)]
+     *               -> nodal SFC reorder -> quantize -> Huffman/ZSTD
+     *
+     * This mesh stores each distinct (x,y,z) 12.7x-23.3x over (15.2x
+     * dataset-wide), so the coarse stream is ~6.6% of nnodes -- far fewer
+     * MGARD elements than the cell-average stream -- and co-located nodes
+     * carry near-identical values, so it predicts much better than the
+     * cell average (residual rms 1.5x-2.6x smaller, measured).
+     *
+     * Marked in the bitstream by ncells == SIZE_MAX (a real centroid stream
+     * can never emit that), so the centroid layout stays untouched.
+     * ================================================================= */
+    if (UseGroupCentroidPath(m_Parameters))
+    {
+        PutParameter(bufferOut, off, (size_t)SIZE_MAX);  /* PATH C marker */
+        PutParameter(bufferOut, off, (size_t)0);         /* npc unused    */
+
+        /* --- coordinates + grouping (cached, geometry-only) --- */
+        const auto t_grp0 = high_resolution_clock::now();
+        LoadConnectivity(m_MeshFile, connVar, m_BlockId);   /* opens mesh reader */
+        const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
+        if (!ResolveAndLoadCoords(m_Parameters, m_MeshFile, connVar, m_BlockId, nx, ny, nz))
+            throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid "
+                                     "requires coordinates; set CENTROID_COORD_PREFIX");
+        {
+            auto vec = g_coordsCache.find({0, m_BlockId});
+            if (vec == g_coordsCache.end() || vec->second.size() != nnodes)
+                throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
+                                         "coordinate length != nnodes for block " +
+                                         std::to_string(m_BlockId));
+        }
+        const CoordGroups &cg = GetOrBuildCoordGroups(m_Backend, m_BlockId,
+                                                      ParseSFC(m_Parameters), nx, ny, nz, nnodes);
+        const size_t ngroups = cg.ngroups;
+        const auto t_grp1 = high_resolution_clock::now();
+        PutParameter(bufferOut, off, ngroups);
+        PutParameter(bufferOut, off, (uint8_t)cg.gmode);
+
+        /* --- coarse: group means, SFC-ordered --- */
+        const auto t_co0 = high_resolution_clock::now();
+        std::vector<char> coarse(ngroups * typeSize);
+        if (type == DataType::Float)
+            cmg_group_mean_f32(m_Backend, reinterpret_cast<const float *>(dataIn), cg.gid.data(),
+                               nnodes, ngroups, reinterpret_cast<float *>(coarse.data()));
+        else
+            cmg_group_mean_f64(m_Backend, reinterpret_cast<const double *>(dataIn), cg.gid.data(),
+                               nnodes, ngroups, reinterpret_cast<double *>(coarse.data()));
+        std::vector<char> coarseSfc(ngroups * typeSize);
+        if (cg.gmode != CMG_SFC_NONE)
+        {
+            if (type == DataType::Float)
+                cmg_perm_forward_f32(reinterpret_cast<const float *>(coarse.data()),
+                                     reinterpret_cast<float *>(coarseSfc.data()),
+                                     cg.gperm.data(), ngroups);
+            else
+                cmg_perm_forward_f64(reinterpret_cast<const double *>(coarse.data()),
+                                     reinterpret_cast<double *>(coarseSfc.data()),
+                                     cg.gperm.data(), ngroups);
+        }
+        else
+            coarseSfc = coarse;
+        const auto t_co1 = high_resolution_clock::now();
+
+        /* --- MGARD the coarse stream --- */
+        const mgard_x::data_type mgTypeC = ToMgardType(type);
+        mgard_x::Config cfgC = MakeMgardConfig(m_Backend);
+        std::vector<mgard_x::SIZE> shapeC = { (mgard_x::SIZE)ngroups };
+        void *mgOut = nullptr; size_t mgSize = 0;
+        const auto t_mg0 = high_resolution_clock::now();
+        mgard_x::compress((mgard_x::DIM)1, mgTypeC, shapeC, tol_avg, s,
+                          mgard_x::error_bound_type::ABS, coarseSfc.data(),
+                          mgOut, mgSize, cfgC, false);
+        const auto t_mg1 = high_resolution_clock::now();
+        if (mgOut == nullptr || mgSize == 0 || mgSize > inputBytes)
+        {
+            if (mgOut) std::free(mgOut);
+            throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
+                                     "coarse MGARD failed for block " + std::to_string(m_BlockId));
+        }
+        PutParameter(bufferOut, off, mgSize);
+        std::memcpy(bufferOut + off, mgOut, mgSize);
+        std::free(mgOut);
+        mgard_x::release_cache(cfgC);
+        off += mgSize;
+
+        /* --- residual against the DECODED coarse (closed loop) --- */
+        const auto t_rs0 = high_resolution_clock::now();
+        void *coarseDec = nullptr;
+        mgard_x::decompress(bufferOut + off - mgSize, mgSize, coarseDec, cfgC, false);
+        if (coarseDec == nullptr)
+            throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
+                                     "coarse round-trip failed");
+        /* undo the group SFC so coarseDecNat is indexed by group id */
+        std::vector<char> coarseNat(ngroups * typeSize);
+        if (cg.gmode != CMG_SFC_NONE)
+        {
+            if (type == DataType::Float)
+                cmg_perm_inverse_f32(reinterpret_cast<const float *>(coarseDec),
+                                     reinterpret_cast<float *>(coarseNat.data()),
+                                     cg.gperm.data(), ngroups);
+            else
+                cmg_perm_inverse_f64(reinterpret_cast<const double *>(coarseDec),
+                                     reinterpret_cast<double *>(coarseNat.data()),
+                                     cg.gperm.data(), ngroups);
+        }
+        else
+            std::memcpy(coarseNat.data(), coarseDec, ngroups * typeSize);
+        std::free(coarseDec);
+
+        std::vector<char> resid(nnodes * typeSize);
+        if (type == DataType::Float)
+            cmg_group_bcast_sub_f32(reinterpret_cast<const float *>(coarseNat.data()),
+                                    cg.gid.data(), nnodes,
+                                    reinterpret_cast<const float *>(dataIn),
+                                    reinterpret_cast<float *>(resid.data()));
+        else
+            cmg_group_bcast_sub_f64(reinterpret_cast<const double *>(coarseNat.data()),
+                                    cg.gid.data(), nnodes,
+                                    reinterpret_cast<const double *>(dataIn),
+                                    reinterpret_cast<double *>(resid.data()));
+
+        /* nodal SFC reorder of the residual (helps the ZSTD stage) */
+        cmg_sfc_t rSfc = CMG_SFC_NONE;
+        const std::vector<uint32_t> &nperm =
+            GetOrBuildNodeSFCPerm(m_Backend, m_BlockId, ParseSFC(m_Parameters), nx, ny, nz,
+                                  nnodes, rSfc);
+        if (rSfc != CMG_SFC_NONE)
+        {
+            std::vector<char> tmp(nnodes * typeSize);
+            if (type == DataType::Float)
+                cmg_perm_forward_f32(reinterpret_cast<const float *>(resid.data()),
+                                     reinterpret_cast<float *>(tmp.data()), nperm.data(), nnodes);
+            else
+                cmg_perm_forward_f64(reinterpret_cast<const double *>(resid.data()),
+                                     reinterpret_cast<double *>(tmp.data()), nperm.data(), nnodes);
+            resid.swap(tmp);
+        }
+        PutParameter(bufferOut, off, (uint8_t)rSfc);
+        PutParameter(bufferOut, off, tol_resi);
+
+        std::vector<uint32_t> quantC(nnodes);
+        if (type == DataType::Float)
+            cmg_quantize_zigzag_f32(m_Backend, reinterpret_cast<const float *>(resid.data()),
+                                    nnodes, tol_resi, quantC.data());
+        else
+            cmg_quantize_zigzag_f64(m_Backend, reinterpret_cast<const double *>(resid.data()),
+                                    nnodes, tol_resi, quantC.data());
+        char *outR = bufferOut + off + sizeof(size_t);
+        size_t capR = mgardx_lossless::serial::Compress(quantC.data(), nnodes, outR,
+                                                        nnodes * sizeof(uint32_t) * 4 + 4096);
+        if (capR == 0)
+            throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
+                                     "residual entropy coding failed");
+        PutParameter(bufferOut, off, capR);
+        off += capR;
+        const auto t_rs1 = high_resolution_clock::now();
+
+        if (m_Verbose)
+            std::cerr << std::fixed << std::setprecision(2)
+                      << "[centroid] block=" << m_BlockId << " path=group_centroid"
+                      << " nnodes=" << nnodes << " ngroups=" << ngroups
+                      << " (" << 100.0 * (double)ngroups / (double)nnodes << "%)"
+                      << " in=" << inputBytes << " out=" << off
+                      << " CR=" << (double)inputBytes / (double)off << "x"
+                      << " (coarse=" << mgSize << "B resid=" << capR << "B)"
+                      << " ms[group=" << duration<double, std::milli>(t_grp1 - t_grp0).count()
+                      << " coarse=" << duration<double, std::milli>(t_co1 - t_co0).count()
+                      << " mgard=" << duration<double, std::milli>(t_mg1 - t_mg0).count()
+                      << " resid=" << duration<double, std::milli>(t_rs1 - t_rs0).count() << "]\n";
+        return off;
     }
 
     /* =================================================================
@@ -977,6 +1206,101 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
 
     const size_t  ncells  = GetParameter<size_t>(bufferIn, off);
     const size_t  npc     = GetParameter<size_t>(bufferIn, off);
+
+    /* ---- PATH C: group-location decomposition (ncells == SIZE_MAX) ---- */
+    if (ncells == SIZE_MAX)
+    {
+        const size_t  ngroups = GetParameter<size_t>(bufferIn, off);
+        const uint8_t gmodeRaw = GetParameter<uint8_t>(bufferIn, off);
+        const cmg_sfc_t gmode = (cmg_sfc_t)gmodeRaw;
+        const size_t  capCoarse = GetParameter<size_t>(bufferIn, off);
+        mgard_x::Config cfgC = MakeMgardConfig(m_Backend);
+
+        /* rebuild the grouping from the mesh coordinates */
+        if (!m_Parameters.count("meshfile"))
+            if (const char *e = std::getenv("CENTROID_MESHFILE")) m_Parameters["meshfile"] = e;
+        if (!m_Parameters.count("connectivity_variable"))
+            if (const char *e = std::getenv("CENTROID_CONN_VAR"))
+                m_Parameters["connectivity_variable"] = e;
+        auto itM = m_Parameters.find("meshfile");
+        auto itC = m_Parameters.find("connectivity_variable");
+        if (itM == m_Parameters.end() || itC == m_Parameters.end())
+            throw std::invalid_argument("[CompressMGARDCentroidOperator::DecompressV5] "
+                                        "group_centroid requires meshfile + connectivity_variable");
+        LoadConnectivity(itM->second, itC->second, blockId);
+        const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
+        if (!ResolveAndLoadCoords(m_Parameters, itM->second, itC->second, blockId, nx, ny, nz))
+            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
+                                     "group_centroid requires coordinates");
+        const CoordGroups &cg = GetOrBuildCoordGroups(m_Backend, blockId, gmode, nx, ny, nz, nnodes);
+        if (cg.ngroups != ngroups)
+            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] rebuilt group "
+                                     "count " + std::to_string(cg.ngroups) + " != bitstream " +
+                                     std::to_string(ngroups));
+
+        /* coarse: MGARD decode, then undo the group SFC */
+        void *coarseDec = nullptr;
+        mgard_x::decompress(bufferIn + off, capCoarse, coarseDec, cfgC, false);
+        if (coarseDec == nullptr)
+            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
+                                     "group_centroid coarse decode failed");
+        off += capCoarse;
+        std::vector<char> coarseNat(ngroups * typeSize);
+        if (gmode != CMG_SFC_NONE)
+        {
+            if (type == DataType::Float)
+                cmg_perm_inverse_f32(reinterpret_cast<const float *>(coarseDec),
+                                     reinterpret_cast<float *>(coarseNat.data()),
+                                     cg.gperm.data(), ngroups);
+            else
+                cmg_perm_inverse_f64(reinterpret_cast<const double *>(coarseDec),
+                                     reinterpret_cast<double *>(coarseNat.data()),
+                                     cg.gperm.data(), ngroups);
+        }
+        else
+            std::memcpy(coarseNat.data(), coarseDec, ngroups * typeSize);
+        std::free(coarseDec);
+
+        /* residual: entropy decode -> dequantize -> undo nodal SFC */
+        const uint8_t rSfcRaw = GetParameter<uint8_t>(bufferIn, off);
+        const cmg_sfc_t rSfc = (cmg_sfc_t)rSfcRaw;
+        const double tolR = GetParameter<double>(bufferIn, off);
+        const size_t capR = GetParameter<size_t>(bufferIn, off);
+        std::vector<uint32_t> quantC(nnodes);
+        if (!mgardx_lossless::serial::Decompress(bufferIn + off, capR, nnodes, quantC.data()))
+            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
+                                     "group_centroid residual decode failed");
+        std::vector<char> resid(nnodes * typeSize);
+        if (type == DataType::Float)
+            cmg_dequantize_zigzag_f32(m_Backend, quantC.data(), nnodes, tolR,
+                                      reinterpret_cast<float *>(resid.data()));
+        else
+            cmg_dequantize_zigzag_f64(m_Backend, quantC.data(), nnodes, tolR,
+                                      reinterpret_cast<double *>(resid.data()));
+        if (rSfc != CMG_SFC_NONE)
+        {
+            cmg_sfc_t rebuilt;
+            const std::vector<uint32_t> &nperm =
+                GetOrBuildNodeSFCPerm(m_Backend, blockId, rSfc, nx, ny, nz, nnodes, rebuilt);
+            if (type == DataType::Float)
+                cmg_perm_inverse_f32(reinterpret_cast<const float *>(resid.data()),
+                                     reinterpret_cast<float *>(dataOut), nperm.data(), nnodes);
+            else
+                cmg_perm_inverse_f64(reinterpret_cast<const double *>(resid.data()),
+                                     reinterpret_cast<double *>(dataOut), nperm.data(), nnodes);
+        }
+        else
+            std::memcpy(dataOut, resid.data(), nnodes * typeSize);
+
+        /* u[n] = coarse[group(n)] + resid[n] */
+        if (type == DataType::Float)
+            cmg_group_bcast_add_f32(reinterpret_cast<const float *>(coarseNat.data()),
+                                    cg.gid.data(), nnodes, reinterpret_cast<float *>(dataOut));
+        else
+            cmg_group_bcast_add_f64(reinterpret_cast<const double *>(coarseNat.data()),
+                                    cg.gid.data(), nnodes, reinterpret_cast<double *>(dataOut));
+        return sizeOut;
+    }
 
     /* ---- PATH B: reorder + plain MGARD (marked by ncells == 0) ---- */
     if (ncells == 0)

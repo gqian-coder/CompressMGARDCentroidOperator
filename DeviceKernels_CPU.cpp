@@ -322,6 +322,80 @@ cmg_sfc_t cmg_build_sfc_perm(cmg_backend_t be, const int64_t *conn,
     return CMG_SFC_MINNODE;
 }
 
+/* ------------------------------------------------------------------ */
+/* Coordinate grouping: nodes sharing an exact (x,y,z) form one group.  */
+/* Deterministic: lexicographic (x,y,z) with the original node index as */
+/* tie-break, so compress and decompress derive identical group ids.    */
+/* ------------------------------------------------------------------ */
+size_t cmg_build_coord_groups(cmg_backend_t be,
+                              const double *X, const double *Y, const double *Z,
+                              size_t nnodes, uint32_t *gid_out,
+                              double *gx, double *gy, double *gz)
+{
+    (void)be;   /* sort-dominated; CPU path is used on both backends */
+    if (nnodes == 0) return 0;
+
+    std::vector<uint32_t> ord(nnodes);
+    for (size_t i = 0; i < nnodes; ++i) ord[i] = (uint32_t)i;
+    std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t c) {
+        if (X[a] != X[c]) return X[a] < X[c];
+        if (Y[a] != Y[c]) return Y[a] < Y[c];
+        if (Z[a] != Z[c]) return Z[a] < Z[c];
+        return a < c;                       /* deterministic tie-break */
+    });
+
+    size_t g = 0;
+    for (size_t i = 0; i < nnodes; ++i)
+    {
+        const uint32_t n = ord[i];
+        if (i > 0)
+        {
+            const uint32_t p = ord[i - 1];
+            if (X[n] != X[p] || Y[n] != Y[p] || Z[n] != Z[p]) ++g;
+        }
+        gid_out[n] = (uint32_t)g;
+        /* all nodes of a group share coordinates; writing each time is a no-op */
+        if (gx) { gx[g] = X[n]; gy[g] = Y[n]; gz[g] = Z[n]; }
+    }
+    return g + 1;
+}
+
+/* Group means. Accumulated in double for both types so the coarse value is
+ * independent of the storage precision (and of accumulation order, since each
+ * group is summed sequentially). */
+void cmg_group_mean_f32(cmg_backend_t be, const float *f, const uint32_t *gid,
+                        size_t nnodes, size_t ngroups, float *out_mean)
+{
+    (void)be;
+    std::vector<double>   acc(ngroups, 0.0);
+    std::vector<uint32_t> cnt(ngroups, 0u);
+    for (size_t n = 0; n < nnodes; ++n) { acc[gid[n]] += (double)f[n]; cnt[gid[n]] += 1u; }
+    for (size_t g = 0; g < ngroups; ++g)
+        out_mean[g] = (float)(cnt[g] ? acc[g] / (double)cnt[g] : 0.0);
+}
+void cmg_group_mean_f64(cmg_backend_t be, const double *f, const uint32_t *gid,
+                        size_t nnodes, size_t ngroups, double *out_mean)
+{
+    (void)be;
+    std::vector<double>   acc(ngroups, 0.0);
+    std::vector<uint32_t> cnt(ngroups, 0u);
+    for (size_t n = 0; n < nnodes; ++n) { acc[gid[n]] += f[n]; cnt[gid[n]] += 1u; }
+    for (size_t g = 0; g < ngroups; ++g)
+        out_mean[g] = cnt[g] ? acc[g] / (double)cnt[g] : 0.0;
+}
+
+void cmg_group_bcast_sub_f32(const float *mean, const uint32_t *gid, size_t nnodes,
+                             const float *f, float *out_resid)
+{ for (size_t n = 0; n < nnodes; ++n) out_resid[n] = f[n] - mean[gid[n]]; }
+void cmg_group_bcast_sub_f64(const double *mean, const uint32_t *gid, size_t nnodes,
+                             const double *f, double *out_resid)
+{ for (size_t n = 0; n < nnodes; ++n) out_resid[n] = f[n] - mean[gid[n]]; }
+
+void cmg_group_bcast_add_f32(const float *mean, const uint32_t *gid, size_t nnodes, float *inout)
+{ for (size_t n = 0; n < nnodes; ++n) inout[n] += mean[gid[n]]; }
+void cmg_group_bcast_add_f64(const double *mean, const uint32_t *gid, size_t nnodes, double *inout)
+{ for (size_t n = 0; n < nnodes; ++n) inout[n] += mean[gid[n]]; }
+
 void cmg_perm_forward_f32(const float  *s, float  *d, const uint32_t *p, size_t n)
 { for (size_t i = 0; i < n; ++i) d[i] = s[p[i]]; }
 void cmg_perm_forward_f64(const double *s, double *d, const uint32_t *p, size_t n)

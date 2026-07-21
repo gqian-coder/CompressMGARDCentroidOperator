@@ -115,6 +115,48 @@ cmg_sfc_t cmg_build_sfc_perm_nodes(cmg_backend_t be,
     uint32_t *perm_out);
 
 /* ------------------------------------------------------------------ */
+/* Coordinate grouping (group-location decomposition).                 */
+/*                                                                     */
+/*   This mesh stores each distinct physical location many times over  */
+/*   (measured 12.7x-23.3x per block, 15.2x dataset-wide), and         */
+/*   co-located nodes carry near-identical values. Grouping nodes by   */
+/*   exact (x,y,z) therefore yields a coarse representation ~6.6% the  */
+/*   size of the nodal field that predicts it far better than the      */
+/*   cell-average does.                                                */
+/*                                                                     */
+/*   Builds, for each node, the id of its coordinate group:            */
+/*     gid_out[n] in [0, ngroups)                                      */
+/*   Groups are numbered in ascending lexicographic (x,y,z) order and  */
+/*   ties broken by original node index, so the mapping is bit-        */
+/*   reproducible between compress and decompress from the same        */
+/*   coordinate array (nothing about it is stored in the bitstream).   */
+/*                                                                     */
+/*   Optionally also emits one representative coordinate per group     */
+/*   (gx/gy/gz, may be NULL) for building an SFC over the groups.      */
+/*                                                                     */
+/*   Returns the number of distinct groups.                            */
+/* ------------------------------------------------------------------ */
+size_t cmg_build_coord_groups(cmg_backend_t be,
+    const double *X, const double *Y, const double *Z, size_t nnodes,
+    uint32_t *gid_out,
+    double *gx, double *gy, double *gz);
+
+/* Group reduction / broadcast for the coarse stream.
+ *   mean : out_mean[g] = average of f over the nodes of group g
+ *   bcast: out[n]      = mean[gid[n]]                                  */
+void cmg_group_mean_f32(cmg_backend_t be, const float  *f, const uint32_t *gid,
+                        size_t nnodes, size_t ngroups, float  *out_mean);
+void cmg_group_mean_f64(cmg_backend_t be, const double *f, const uint32_t *gid,
+                        size_t nnodes, size_t ngroups, double *out_mean);
+void cmg_group_bcast_sub_f32(const float  *mean, const uint32_t *gid, size_t nnodes,
+                             const float  *f, float  *out_resid);
+void cmg_group_bcast_sub_f64(const double *mean, const uint32_t *gid, size_t nnodes,
+                             const double *f, double *out_resid);
+/* inout[n] += mean[gid[n]]  (decompress recombine) */
+void cmg_group_bcast_add_f32(const float  *mean, const uint32_t *gid, size_t nnodes, float  *inout);
+void cmg_group_bcast_add_f64(const double *mean, const uint32_t *gid, size_t nnodes, double *inout);
+
+/* ------------------------------------------------------------------ */
 /* Linear quantization (mid-tread, quantum = 2*tolerance) + zigzag.    */
 /*   Output is uint32_t suitable for MGARD-X Huffman+ZSTD.             */
 /* ------------------------------------------------------------------ */
