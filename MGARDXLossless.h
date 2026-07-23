@@ -75,6 +75,14 @@ bool Decompress(const char *h_in, std::size_t in_len,
 std::size_t CompressFromHost(const std::uint32_t *h_quant, std::size_t n,
                              char *h_out, std::size_t h_out_cap);
 
+/* Device-resident variant: `d_quant` is a HIP DEVICE pointer (e.g. produced by
+ * the fused pipeline), consumed in place with NO H2D. `max_code` is the max
+ * code value (device-side reduce by the caller) used for the dict guard.
+ * Output framing is identical to CompressFromHost / serial::Compress. */
+std::size_t CompressFromDevice(const std::uint32_t *d_quant, std::size_t n,
+                               std::uint32_t max_code,
+                               char *h_out, std::size_t h_out_cap);
+
 } // namespace hip
 
 } // namespace mgardx_lossless

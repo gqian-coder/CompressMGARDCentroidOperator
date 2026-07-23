@@ -87,7 +87,7 @@ if(ENABLE_HIP)
   target_include_directories(mgardx_lossless_hip PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
   target_link_libraries(mgardx_lossless_hip
-    PRIVATE hip::device mgard::mgard)
+    PRIVATE hip::device mgard::mgard "${ZSTD_LIBRARY}")
   target_compile_definitions(mgardx_lossless_hip PRIVATE
     __HIP_PLATFORM_AMD__ ENABLE_HIP MGARDX_COMPILE_HIP)
   set_target_properties(mgardx_lossless_hip PROPERTIES

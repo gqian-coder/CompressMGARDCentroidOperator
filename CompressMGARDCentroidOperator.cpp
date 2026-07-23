@@ -49,8 +49,6 @@ namespace
 {
 
 constexpr uint8_t kBufferVersion = 5;
-constexpr uint8_t kResMarker_MGARD = 0;
-constexpr uint8_t kResMarker_MGARDX_Huff = 1;
 
 /* First byte of the 4-byte per-operator header. Matches the value the
  * v1 (core::Operator-derived) interface wrote via MakeCommonHeader
@@ -105,20 +103,12 @@ cmg_sfc_t ParseSFC(const Params &params)
     return CMG_SFC_HILBERT;
 }
 
-bool IsSFCEnabled(const Params &params)
-{
-    auto it = params.find("cell_sfc");
-    if (it != params.end() && EnvIsOff(it->second)) return false;
-    if (const char *e = std::getenv("CENTROID_SFC"))
-        if (EnvIsOff(std::string(e))) return false;
-    return true;
-}
-
 /* Compression path selector.
  *
- *   "centroid" (default) : cell-average + nodal-residual split; the cell
- *                          averages are SFC-reordered and MGARD-compressed,
- *                          the residual is quantized + entropy coded.
+ *   "group_centroid" (default) : coarse stream is one value per distinct
+ *                          coordinate location, SFC-reordered + MGARD; the
+ *                          per-node residual is nodal-SFC reordered, quantized
+ *                          and entropy coded (see UseGroupCentroidPath).
  *   "reorder_mgard"      : gather the nodal field along a nodal SFC (Hilbert)
  *                          and hand the whole field to MGARD's 1-D multilevel
  *                          transform. No split, so no cell-average stream and
@@ -126,7 +116,8 @@ bool IsSFCEnabled(const Params &params)
  *                          sampled hierarchy performs the coarse/detail
  *                          separation instead.
  *
- * Select with the "method" parameter or CENTROID_METHOD env var. */
+ * Select with the "method" parameter or CENTROID_METHOD env var; unset picks
+ * group_centroid. */
 std::string MethodName(const Params &params)
 {
     std::string v;
@@ -152,7 +143,8 @@ bool UseReorderMgardPath(const Params &params)
 bool UseGroupCentroidPath(const Params &params)
 {
     const std::string v = MethodName(params);
-    return v == "group_centroid" || v == "group" || v == "location";
+    /* group_centroid is the default when no method is specified. */
+    return v.empty() || v == "group_centroid" || v == "group" || v == "location";
 }
 
 /* Nodal SFC reorder of the RESIDUAL before entropy coding.
@@ -200,6 +192,44 @@ bool IsResidualSFCEnabled(const Params &params)
  * threshold while individual values sit well above it, so it discards real
  * information -- U_aver relL2 2.84e-3 -> 6.57e-3 -- and only stays legal by
  * spending error budget the other paths leave unused.) */
+/* Residual prediction is always OPEN LOOP: residual = u - ORIGINAL coarse.
+ *
+ * The coarse stream's own compression error is not cancelled, so errors add:
+ * <= tol_avg + tol_resi = absTol -- exactly what the ebratio budget split
+ * already provisions, so the output stays inside the requested bound (it just
+ * spends the tol_avg allocation instead of leaving it unused). This avoids the
+ * extra per-block-per-field mgard_x::decompress of the coarse stream that a
+ * closed loop would cost, and lets the fused device-resident pipeline keep the
+ * coarse stream on the GPU. (The removed closed loop recomputed the residual
+ * against the DECODED coarse to cancel that error into <= tol_resi.) */
+
+/* Coordinate-grouping tolerance, as a fraction of the per-axis bounding-box
+ * extent. Nodes whose coordinates agree to within this are treated as one
+ * physical location.
+ *
+ * Exact (bitwise) grouping is only right when the writer emitted byte-identical
+ * coordinates for coincident nodes. p1 does; p3 does NOT -- there roughly half
+ * of the coincident nodes differ by an ULP or two, so exact grouping finds
+ * 47.6% distinct locations where the true geometric count is 23.2%, doubling
+ * the coarse stream for nothing. The distinct count is flat across tol =
+ * 1e-9..1e-5 on p3 and unchanged up to 1e-6 on p1, so 1e-7 is ~2 decades inside
+ * the plateau on both meshes.
+ *
+ * Set group_tol / CENTROID_GROUP_TOL to 0 for the old exact behaviour. The
+ * value must match between compress and decompress; both take the same default.
+ */
+double GroupTolerance(const Params &params)
+{
+    auto it = params.find("group_tol");
+    const char *e = (it != params.end()) ? it->second.c_str()
+                                         : std::getenv("CENTROID_GROUP_TOL");
+    if (e == nullptr || *e == '\0') return 1e-7;
+    char *end = nullptr;
+    const double v = std::strtod(e, &end);
+    if (end == e || !(v >= 0.0)) return 1e-7;
+    return v;
+}
+
 bool IsAdaptiveResidualEnabled(const Params &params)
 {
     auto it = params.find("adaptive_residual");
@@ -208,22 +238,67 @@ bool IsAdaptiveResidualEnabled(const Params &params)
     return true;
 }
 
-/* Residual backend selector: "huffman" (default) = quantize -> MGARD-X
- * Huffman/ZSTD; "mgard" = MGARD-lossy directly on the raw residual. Settable
- * via the residual_method parameter or MGARD_RESIDUAL_METHOD env var.
- * MGARD-lossy exploits the residual's spatial smoothness (useful once the
- * nodal SFC reorder has made the residual spatially local), whereas the
- * entropy coder only sees the value distribution / sequential runs. */
-bool UseMgardResidual(const Params &params)
+/* Device-resident fused open-loop group_centroid pipeline (Priority 2). Default
+ * on for the HIP open-loop path; set fused=off / CENTROID_FUSED=0 to force the
+ * staged path (same math) for A/B measurement. */
+bool IsFusedPipelineEnabled(const Params &params)
 {
-    auto pick = [](std::string v) {
-        for (auto &c : v) c = (char)std::tolower((unsigned char)c);
-        return v == "mgard";
-    };
-    auto it = params.find("residual_method");
-    if (it != params.end()) return pick(it->second);
-    if (const char *e = std::getenv("MGARD_RESIDUAL_METHOD")) return pick(std::string(e));
-    return false;
+    auto it = params.find("fused");
+    if (it != params.end()) return !EnvIsOff(it->second);
+    if (const char *e = std::getenv("CENTROID_FUSED")) return !EnvIsOff(std::string(e));
+    return true;
+}
+
+/* Route the residual entropy coding to the HIP (GPU) Huffman+ZSTD backend.
+ *
+ * Now WORKING end-to-end after three MGARD fixes + this wrapper's framing:
+ *   1. Huffman::outlier_count default-initialized (was uninit -> OOM/bad Copy1D).
+ *   2. GetCodebook throws (was exit()) on codeword > H-budget, so the wrapper
+ *      can fall back to raw Zstd.
+ *   3. HuffmanWorkspace status_array made NON-managed: atomicMin on coarse-grained
+ *      managed memory is unreliable on ROCm, which corrupted GenerateCW's
+ *      canonical codewords (invalid, non-prefix-free) -> undecodable stream.
+ * CompressFromHost here mirrors serial::Compress: dict 8192 (matches the
+ * decoder), a max_code guard, tag-byte framing, and a raw-Zstd fallback, so the
+ * HIP-produced residual stream is decodable by serial::Decompress.
+ *
+ * Verified: group_centroid P_aver/U_aver/uu round-trip to the SAME relL2 as the
+ * CPU backend. DEFAULT OFF (opt-in via CENTROID_HIP_LOSSLESS=1) pending a
+ * broader multi-block/compute-node sweep; the CG code path is used on Frontier
+ * (SupportCG), which is what these fixes were validated against. */
+/* Keep the fused pipeline's coarse stream + quantized codes on the GPU and feed
+ * them to MGARD-HIP and hip::CompressFromDevice in place (no D2H/H2D). Default
+ * on; device_resident=off / CENTROID_DEVRESIDENT=0 forces the host-copy path
+ * (A/B of the transfer savings). Only active when both MGARD and lossless are HIP. */
+bool IsDeviceResidentEnabled(const Params &params)
+{
+    auto it = params.find("device_resident");
+    if (it != params.end()) return !EnvIsOff(it->second);
+    if (const char *e = std::getenv("CENTROID_DEVRESIDENT")) return !EnvIsOff(std::string(e));
+    return true;
+}
+
+bool IsHipLosslessEnabled(const Params &params)
+{
+    auto it = params.find("hip_lossless");
+    if (it != params.end()) return !EnvIsOff(it->second);
+    if (const char *e = std::getenv("CENTROID_HIP_LOSSLESS")) return !EnvIsOff(std::string(e));
+    /* Default ON: the MGARD-X HIP Huffman codec is fixed (managed-memory
+     * atomicMin, outlier_count init, catchable codeword-overflow) and verified
+     * bit-compatible with the SERIAL decoder. Only meaningful on the HIP
+     * backend; the CompressResidualCodes helper falls back to SERIAL otherwise. */
+    return true;
+}
+
+/* Framing-agnostic helper: encode the quantized residual with either backend
+ * into `dst` (host), picking HIP when enabled on the HIP backend. */
+inline size_t CompressResidualCodes(cmg_backend_t be, const Params &params,
+                                    const uint32_t *quant, size_t n,
+                                    char *dst, size_t cap)
+{
+    if (be == CMG_BACKEND_HIP && IsHipLosslessEnabled(params))
+        return mgardx_lossless::hip::CompressFromHost(quant, n, dst, cap);
+    return mgardx_lossless::serial::Compress(quant, n, dst, cap);
 }
 
 /* ------ per-process mesh cache (connectivity + coords) -------------- */
@@ -236,15 +311,10 @@ adios2::IO                                                  g_io_mesh;
 adios2::Engine                                              g_reader_mesh;
 std::map<size_t, std::vector<int64_t>>                      g_connCache;
 std::map<std::pair<int, size_t>, std::vector<double>>       g_coordsCache;
-/* SFC permutation cache: keyed by block id. The mesh (connectivity + coords) is
- * time- and variable-invariant within a process, so the permutation is the same
- * for every variable/timestep of a block; caching it avoids rebuilding the
- * Hilbert sort on every (de)compress call. */
-std::map<size_t, std::vector<uint32_t>>                     g_permCache;
-std::map<size_t, cmg_sfc_t>                                 g_permMode;
-/* Nodal SFC permutation + the connectivity remapped through it. Same caching
- * rationale as g_permCache: geometry-derived, so identical for every variable
- * and timestep of a block. */
+/* Nodal SFC permutation cache, keyed by block id. The mesh (connectivity +
+ * coords) is time- and variable-invariant within a process, so the permutation
+ * is identical for every variable/timestep of a block; caching it avoids
+ * rebuilding the Hilbert sort on every (de)compress call. */
 std::map<size_t, std::vector<uint32_t>>                     g_nodePermCache;
 std::map<size_t, cmg_sfc_t>                                 g_nodePermMode;
 /* Coordinate-group cache (group_centroid path): gid per node, the group count,
@@ -357,35 +427,8 @@ bool ResolveAndLoadCoords(const Params &params, const std::string &meshFile,
     return true;
 }
 
-/* Build, or fetch from the per-process cache, the SFC permutation for a block.
- * Cached by block id: connectivity + coordinates are invariant within a process,
- * so a block's permutation is identical across all variables and timesteps. This
- * turns O(vars * blocks) permutation builds into O(blocks). Used by both compress
- * (forward reorder) and decompress (inverse reorder). */
-const std::vector<uint32_t> &GetOrBuildSFCPerm(cmg_backend_t be, size_t blockId,
-                                               cmg_sfc_t requested, const int64_t *conn,
-                                               size_t ncells, size_t npc, const double *cx,
-                                               const double *cy, const double *cz, size_t nnodes,
-                                               cmg_sfc_t &actualMode)
-{
-    std::lock_guard<std::mutex> lck(g_meshMutex);
-    auto it = g_permCache.find(blockId);
-    if (it != g_permCache.end())
-    {
-        actualMode = g_permMode[blockId];
-        return it->second;
-    }
-    std::vector<uint32_t> perm(ncells);
-    actualMode =
-        cmg_build_sfc_perm(be, conn, ncells, npc, cx, cy, cz, nnodes, requested, perm.data());
-    g_permMode[blockId] = actualMode;
-    auto &slot = g_permCache[blockId];
-    slot = std::move(perm);
-    return slot;
-}
-
-/* ------ nodal SFC permutation (reorder BEFORE the centroid split) ---- */
-/* Like the cell permutation, the nodal ordering depends only on the mesh
+/* ------ nodal SFC permutation ---------------------------------------- */
+/* The nodal ordering depends only on the mesh
  * geometry, so it is identical for every variable and timestep of a block and
  * is built once per block. The remapped connectivity derived from it is cached
  * alongside. Neither is stored in the bitstream: both are recomputed from the
@@ -416,7 +459,8 @@ const std::vector<uint32_t> &GetOrBuildNodeSFCPerm(cmg_backend_t be, size_t bloc
  * variable and timestep, and re-derived on read, so it costs no stored bytes. */
 const CoordGroups &GetOrBuildCoordGroups(cmg_backend_t be, size_t blockId,
                                          cmg_sfc_t requested, const double *X,
-                                         const double *Y, const double *Z, size_t nnodes)
+                                         const double *Y, const double *Z, size_t nnodes,
+                                         double tol)
 {
     std::lock_guard<std::mutex> lck(g_meshMutex);
     auto it = g_groupCache.find(blockId);
@@ -425,7 +469,7 @@ const CoordGroups &GetOrBuildCoordGroups(cmg_backend_t be, size_t blockId,
     CoordGroups cg;
     cg.gid.resize(nnodes);
     std::vector<double> gx(nnodes), gy(nnodes), gz(nnodes);   /* upper bound */
-    cg.ngroups = cmg_build_coord_groups(be, X, Y, Z, nnodes, cg.gid.data(),
+    cg.ngroups = cmg_build_coord_groups(be, X, Y, Z, nnodes, tol, cg.gid.data(),
                                         gx.data(), gy.data(), gz.data());
     gx.resize(cg.ngroups); gy.resize(cg.ngroups); gz.resize(cg.ngroups);
     cg.gperm.resize(cg.ngroups);
@@ -452,16 +496,22 @@ size_t TypeNBytes(DataType t)
         "[CompressMGARDCentroidOperator::TypeNBytes] Only float/double supported");
 }
 
-mgard_x::Config MakeMgardConfig(cmg_backend_t /*be*/)
+mgard_x::Config MakeMgardConfig(cmg_backend_t be)
 {
     mgard_x::Config cfg;
     cfg.lossless = mgard_x::lossless_type::Huffman_Zstd;
-    /* Default the internal MGARD to SERIAL even when the centroid device kernels
-     * run on the GPU: MGARD here only compresses the small per-cell average
-     * array, for which CPU MGARD (no H2D/D2H or GPU workspace-rebuild overhead)
-     * is faster than HIP. Set MGARD_X_DEVICE_TYPE=HIP to override for a
-     * fully-GPU pipeline. */
+    /* Default the internal MGARD to match the compute backend: on HIP the coarse
+     * stream stays device-resident (the fused pipeline hands MGARD its on-device
+     * pointer, which MGARD-X detects and compresses in place -- no H2D), so GPU
+     * MGARD is the right default. CPU builds stay SERIAL. Override with
+     * MGARD_X_DEVICE_TYPE. */
+#ifdef CMG_HAVE_HIP
+    cfg.dev_type = (be == CMG_BACKEND_HIP) ? mgard_x::device_type::HIP
+                                           : mgard_x::device_type::SERIAL;
+#else
+    (void)be;
     cfg.dev_type = mgard_x::device_type::SERIAL;
+#endif
     /* explicit override wins */
     if (const char *e = std::getenv("MGARD_X_DEVICE_TYPE"))
     {
@@ -733,11 +783,171 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                                          std::to_string(m_BlockId));
         }
         const CoordGroups &cg = GetOrBuildCoordGroups(m_Backend, m_BlockId,
-                                                      ParseSFC(m_Parameters), nx, ny, nz, nnodes);
+                                                      ParseSFC(m_Parameters), nx, ny, nz, nnodes,
+                                                      GroupTolerance(m_Parameters));
         const size_t ngroups = cg.ngroups;
         const auto t_grp1 = high_resolution_clock::now();
         PutParameter(bufferOut, off, ngroups);
         PutParameter(bufferOut, off, (uint8_t)cg.gmode);
+
+        /* =============================================================
+         * PATH C, FAST: device-resident open-loop pipeline (HIP only).
+         *
+         * Fuses group-mean, coarse SFC, open-loop residual, stats, residual
+         * SFC and quantize into one device-resident call -- the field is
+         * uploaded once and the residual never round-trips (Priority 2). The
+         * geometry (gid/gperm/nperm) is cached on the device across the block's
+         * variables. Only the small coarse stream (-> MGARD) and quantized
+         * codes (-> Huffman) come back. Closed loop still needs the decoded
+         * coarse mid-pipeline, so it keeps the staged path below.
+         * ============================================================= */
+        if (m_Backend == CMG_BACKEND_HIP && IsFusedPipelineEnabled(m_Parameters))
+        {
+            /* residual SFC permutation (geometry, cached) built up front so the
+             * fused call can gather on device. Unlike the staged path this is
+             * built even when the residual is ultimately dropped, but it is
+             * cached per block and amortized across the block's variables. */
+            cmg_sfc_t rSfc = CMG_SFC_NONE;
+            const uint32_t *npermPtr = nullptr;
+            const auto t_np0 = high_resolution_clock::now();
+            if (IsResidualSFCEnabled(m_Parameters))
+            {
+                const std::vector<uint32_t> &nperm = GetOrBuildNodeSFCPerm(
+                    m_Backend, m_BlockId, ParseSFC(m_Parameters), nx, ny, nz, nnodes, rSfc);
+                if (rSfc != CMG_SFC_NONE) npermPtr = nperm.data();
+            }
+            const auto t_np1 = high_resolution_clock::now();
+
+            const uint32_t *gpermPtr =
+                (cg.gmode != CMG_SFC_NONE) ? cg.gperm.data() : nullptr;
+            const int adaptive = IsAdaptiveResidualEnabled(m_Parameters) ? 1 : 0;
+
+            /* Fully device-resident when both MGARD and the lossless run on the
+             * GPU: the fused pipeline keeps the coarse stream and quantized
+             * codes on the device, MGARD-HIP compresses the coarse in place
+             * (IsDevicePointer), and hip::CompressFromDevice consumes the codes
+             * in place -- no D2H/H2D of either the ~ngroups coarse or the ~nnodes
+             * codes. Otherwise fall back to host buffers. */
+            const mgard_x::data_type mgTypeC = ToMgardType(type);
+            mgard_x::Config cfgC = MakeMgardConfig(m_Backend);
+            const bool devResident =
+                (cfgC.dev_type == mgard_x::device_type::HIP) && IsHipLosslessEnabled(m_Parameters)
+                && IsDeviceResidentEnabled(m_Parameters);
+
+            std::vector<char> coarseSfc;
+            std::vector<uint32_t> quantC;
+            if (!devResident) { coarseSfc.resize(ngroups * typeSize); quantC.resize(nnodes); }
+            void *d_coarse_dev = nullptr, *d_q_dev = nullptr;
+            uint32_t maxcode = 0;
+            double rmin = 0.0, rmax = 0.0, rsumsq = 0.0;
+            int drop = 0, handled = 0;
+
+            const auto t_fu0 = high_resolution_clock::now();
+            if (type == DataType::Float)
+                handled = cmg_group_compress_f32(
+                    m_Backend, m_BlockId, reinterpret_cast<const float *>(dataIn),
+                    cg.gid.data(), gpermPtr, npermPtr, nnodes, ngroups, tol_resi, adaptive,
+                    devResident ? nullptr : reinterpret_cast<float *>(coarseSfc.data()),
+                    &rmin, &rmax, &rsumsq, &drop,
+                    devResident ? nullptr : quantC.data(),
+                    devResident ? &d_coarse_dev : nullptr,
+                    devResident ? &d_q_dev : nullptr, devResident ? &maxcode : nullptr);
+            else
+                handled = cmg_group_compress_f64(
+                    m_Backend, m_BlockId, reinterpret_cast<const double *>(dataIn),
+                    cg.gid.data(), gpermPtr, npermPtr, nnodes, ngroups, tol_resi, adaptive,
+                    devResident ? nullptr : reinterpret_cast<double *>(coarseSfc.data()),
+                    &rmin, &rmax, &rsumsq, &drop,
+                    devResident ? nullptr : quantC.data(),
+                    devResident ? &d_coarse_dev : nullptr,
+                    devResident ? &d_q_dev : nullptr, devResident ? &maxcode : nullptr);
+            const auto t_fu1 = high_resolution_clock::now();
+
+            if (handled)
+            {
+                const double residRms  = (nnodes > 0) ? std::sqrt(rsumsq / (double)nnodes) : 0.0;
+                const double residLinf = std::max(std::fabs(rmin), std::fabs(rmax));
+                const bool dropResidual = (drop != 0);
+
+                /* --- MGARD the coarse stream (device pointer when devResident,
+                 *     which MGARD-X compresses in place with no H2D) --- */
+                std::vector<mgard_x::SIZE> shapeC = { (mgard_x::SIZE)ngroups };
+                void *mgIn = devResident ? d_coarse_dev
+                                         : static_cast<void *>(coarseSfc.data());
+                void *mgOut = nullptr; size_t mgSize = 0;
+                const auto t_mg0 = high_resolution_clock::now();
+                mgard_x::compress((mgard_x::DIM)1, mgTypeC, shapeC, tol_avg, s,
+                                  mgard_x::error_bound_type::ABS, mgIn,
+                                  mgOut, mgSize, cfgC, false);
+                const auto t_mg1 = high_resolution_clock::now();
+                if (devResident) cmg_hip_free(d_coarse_dev);
+                if (mgOut == nullptr || mgSize == 0 || mgSize > inputBytes)
+                {
+                    /* device input => mgOut is a DEVICE pointer (MGARD-X keeps
+                     * output in the input's memory space); free accordingly. */
+                    if (mgOut) { if (devResident) cmg_hip_free(mgOut); else std::free(mgOut); }
+                    if (devResident) cmg_hip_free(d_q_dev);
+                    throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] "
+                                             "group_centroid(fused): coarse MGARD failed for block "
+                                             + std::to_string(m_BlockId));
+                }
+                PutParameter(bufferOut, off, mgSize);
+                if (devResident) { cmg_hip_d2h(bufferOut + off, mgOut, mgSize); cmg_hip_free(mgOut); }
+                else             { std::memcpy(bufferOut + off, mgOut, mgSize); std::free(mgOut); }
+                mgard_x::release_cache(cfgC);
+                off += mgSize;
+
+                /* residual SFC mode + tol; NONE when the residual is dropped */
+                PutParameter(bufferOut, off, (uint8_t)(dropResidual ? CMG_SFC_NONE : rSfc));
+                PutParameter(bufferOut, off, tol_resi);
+
+                size_t capR = 0;
+                const auto t_ls0 = high_resolution_clock::now();
+                if (!dropResidual)
+                {
+                    char *outR = bufferOut + off + sizeof(size_t);
+                    const size_t cap = nnodes * sizeof(uint32_t) * 4 + 4096;
+#ifdef CMG_HAVE_HIP
+                    if (devResident)
+                        capR = mgardx_lossless::hip::CompressFromDevice(
+                            static_cast<const uint32_t *>(d_q_dev), nnodes, maxcode, outR, cap);
+                    else
+#endif
+                        capR = CompressResidualCodes(m_Backend, m_Parameters, quantC.data(),
+                                                     nnodes, outR, cap);
+                    if (capR == 0) {
+                        if (devResident) cmg_hip_free(d_q_dev);
+                        throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] "
+                            "group_centroid(fused): residual entropy coding failed");
+                    }
+                }
+                if (devResident) cmg_hip_free(d_q_dev);
+                PutParameter(bufferOut, off, capR);
+                off += capR;
+                const auto t_ls1 = high_resolution_clock::now();
+
+                if (m_Verbose)
+                    std::cerr << std::fixed << std::setprecision(2)
+                        << "[centroid] block=" << m_BlockId << " path=group_centroid(fused)"
+                        << " nnodes=" << nnodes << " ngroups=" << ngroups
+                        << " (" << 100.0 * (double)ngroups / (double)nnodes << "%)"
+                        << " in=" << inputBytes << " out=" << off
+                        << " CR=" << (double)inputBytes / (double)off << "x"
+                        << " (coarse=" << mgSize << "B resid=" << capR << "B)"
+                        << (dropResidual ? " NO-RESIDUAL" : "") << " open_loop"
+                        << " residRms=" << residRms << " residLinf=" << residLinf
+                        << " tol_resi=" << tol_resi
+                        << " ms[groupbuild=" << duration<double, std::milli>(t_grp1 - t_grp0).count()
+                        << " nodepermbuild=" << duration<double, std::milli>(t_np1 - t_np0).count()
+                        << " gather=0.00 rms=0.00 coarsedecode=0.00 coarse=0.00"
+                        << " fused=" << duration<double, std::milli>(t_fu1 - t_fu0).count()
+                        << " mgard=" << duration<double, std::milli>(t_mg1 - t_mg0).count()
+                        << " resid=" << duration<double, std::milli>(t_ls1 - t_ls0).count()
+                        << "]\n";
+                return off;
+            }
+            /* handled == 0 (HIP unavailable at runtime): fall through to staged path */
+        }
 
         /* --- coarse: group means, SFC-ordered --- */
         const auto t_co0 = high_resolution_clock::now();
@@ -786,29 +996,11 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         mgard_x::release_cache(cfgC);
         off += mgSize;
 
-        /* --- residual against the DECODED coarse (closed loop) --- */
+        /* --- residual: open loop (vs the ORIGINAL coarse). `coarse` is already
+         *     in natural group order -- the SFC gather went into coarseSfc -- so
+         *     it is used directly, with no extra MGARD decode of the stream. --- */
         const auto t_rs0 = high_resolution_clock::now();
-        void *coarseDec = nullptr;
-        mgard_x::decompress(bufferOut + off - mgSize, mgSize, coarseDec, cfgC, false);
-        if (coarseDec == nullptr)
-            throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
-                                     "coarse round-trip failed");
-        /* undo the group SFC so coarseDecNat is indexed by group id */
-        std::vector<char> coarseNat(ngroups * typeSize);
-        if (cg.gmode != CMG_SFC_NONE)
-        {
-            if (type == DataType::Float)
-                cmg_perm_inverse_f32(reinterpret_cast<const float *>(coarseDec),
-                                     reinterpret_cast<float *>(coarseNat.data()),
-                                     cg.gperm.data(), ngroups);
-            else
-                cmg_perm_inverse_f64(reinterpret_cast<const double *>(coarseDec),
-                                     reinterpret_cast<double *>(coarseNat.data()),
-                                     cg.gperm.data(), ngroups);
-        }
-        else
-            std::memcpy(coarseNat.data(), coarseDec, ngroups * typeSize);
-        std::free(coarseDec);
+        std::vector<char> &coarseNat = coarse;
 
         std::vector<char> resid(nnodes * typeSize);
         if (type == DataType::Float)
@@ -883,8 +1075,8 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                 cmg_quantize_zigzag_f64(m_Backend, reinterpret_cast<const double *>(resid.data()),
                                         nnodes, tol_resi, quantC.data());
             char *outR = bufferOut + off + sizeof(size_t);
-            capR = mgardx_lossless::serial::Compress(quantC.data(), nnodes, outR,
-                                                     nnodes * sizeof(uint32_t) * 4 + 4096);
+            capR = CompressResidualCodes(m_Backend, m_Parameters, quantC.data(), nnodes, outR,
+                                         nnodes * sizeof(uint32_t) * 4 + 4096);
             if (capR == 0)
                 throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid: "
                                          "residual entropy coding failed");
@@ -901,7 +1093,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                       << " in=" << inputBytes << " out=" << off
                       << " CR=" << (double)inputBytes / (double)off << "x"
                       << " (coarse=" << mgSize << "B resid=" << capR << "B)"
-                      << (dropResidual ? " NO-RESIDUAL" : "")
+                      << (dropResidual ? " NO-RESIDUAL" : "") << " open_loop"
                       << " residRms=" << residRms << " residLinf=" << residLinf
                       << " tol_resi=" << tol_resi
                       << " ms[groupbuild=" << duration<double, std::milli>(t_grp1 - t_grp0).count()
@@ -1027,233 +1219,14 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         return off;
     }
 
-    /* ---- connectivity ---- */
-    const auto t_conn0 = high_resolution_clock::now();
-    const auto &conn = LoadConnectivity(m_MeshFile, connVar, m_BlockId);
-    const auto t_conn1 = high_resolution_clock::now();
-    if (conn.size() % m_NodesPerCell != 0)
-        throw std::invalid_argument("[CompressMGARDCentroidOperator::Operate] Connectivity "
-                                    "length not a multiple of nodes_per_cell");
-    const size_t ncells = conn.size() / m_NodesPerCell;
-    PutParameter(bufferOut, off, ncells);
-    PutParameter(bufferOut, off, m_NodesPerCell);
-
-    /* ---- centroid split ---- */
-    std::vector<char> cellAvgBuf (ncells * typeSize);
-    std::vector<char> residualBuf(nnodes * typeSize);
-    const auto t_split0 = high_resolution_clock::now();
-    if (type == DataType::Float)
-    {
-        cmg_centroid_split_f32(m_Backend,
-            reinterpret_cast<const float *>(dataIn), conn.data(),
-            ncells, m_NodesPerCell, nnodes,
-            reinterpret_cast<float *>(cellAvgBuf.data()),
-            reinterpret_cast<float *>(residualBuf.data()));
-    }
-    else
-    {
-        cmg_centroid_split_f64(m_Backend,
-            reinterpret_cast<const double *>(dataIn), conn.data(),
-            ncells, m_NodesPerCell, nnodes,
-            reinterpret_cast<double *>(cellAvgBuf.data()),
-            reinterpret_cast<double *>(residualBuf.data()));
-    }
-    const auto t_split1 = high_resolution_clock::now();
-
-    /* ---- SFC reorder of cell averages ---- */
-    cmg_sfc_t sfcMode = CMG_SFC_NONE;
-    const auto t_sfc0 = high_resolution_clock::now();
-    if (IsSFCEnabled(m_Parameters))
-    {
-        const double *cx = nullptr, *cy = nullptr, *cz = nullptr;
-        const bool haveCoords =
-            ResolveAndLoadCoords(m_Parameters, m_MeshFile, connVar, m_BlockId, cx, cy, cz);
-        if (haveCoords)
-        {
-            auto vec = g_coordsCache.find({0, m_BlockId});
-            if (vec == g_coordsCache.end() || vec->second.size() != nnodes)
-                cx = cy = cz = nullptr;
-        }
-        const cmg_sfc_t want = ParseSFC(m_Parameters);
-        const std::vector<uint32_t> &perm =
-            GetOrBuildSFCPerm(m_Backend, m_BlockId, want, conn.data(), ncells, m_NodesPerCell, cx,
-                              cy, cz, nnodes, sfcMode);
-
-        std::vector<char> sortedAvg(ncells * typeSize);
-        if (type == DataType::Float)
-            cmg_perm_forward_f32(reinterpret_cast<const float *>(cellAvgBuf.data()),
-                                 reinterpret_cast<float *>(sortedAvg.data()),
-                                 perm.data(), ncells);
-        else
-            cmg_perm_forward_f64(reinterpret_cast<const double *>(cellAvgBuf.data()),
-                                 reinterpret_cast<double *>(sortedAvg.data()),
-                                 perm.data(), ncells);
-        cellAvgBuf.swap(sortedAvg);
-    }
-    PutParameter(bufferOut, off, (uint8_t)sfcMode);
-    const auto t_sfc1 = high_resolution_clock::now();
-
-    /* ---- MGARD compress cell averages ---- */
-    const mgard_x::data_type mgardType = ToMgardType(type);
-    mgard_x::Config cfg = MakeMgardConfig(m_Backend);
-
-    auto compressMgard1D = [&](void *src, size_t n, double tol, void *dst, size_t &dstCap) {
-        std::vector<mgard_x::SIZE> shape = { (mgard_x::SIZE)n };
-        /* Let MGARD-X allocate its own output buffer; we then copy into the
-         * ADIOS2 buffer. Passing a pre-allocated buffer triggers a corrupted
-         * internal allocation request (PB-scale) on the SERIAL adapter when
-         * the MGARD-X library is loaded inside an ADIOS2 plugin context. */
-        void *mgardOut = nullptr;
-        size_t mgardSize = 0;
-        mgard_x::compress((mgard_x::DIM)1, mgardType, shape, tol, s,
-                          mgard_x::error_bound_type::ABS, src,
-                          mgardOut, mgardSize, cfg, false);
-        if (mgardOut == nullptr || mgardSize == 0)
-        {
-            if (m_Verbose)
-                std::cerr << "[centroid] mgard_x::compress returned empty buffer "
-                             "(n=" << n << " tol=" << tol << ")\n";
-            dstCap = 0;
-            return;
-        }
-        if (mgardSize > dstCap)
-        {
-            if (m_Verbose)
-                std::cerr << "[centroid] mgard_x output (" << mgardSize
-                          << " B) exceeds reserved capacity (" << dstCap
-                          << " B); aborting block.\n";
-            std::free(mgardOut);
-            dstCap = 0;
-            return;
-        }
-        std::memcpy(dst, mgardOut, mgardSize);
-        std::free(mgardOut);
-        dstCap = mgardSize;
-        mgard_x::release_cache(cfg);
-    };
-
-    size_t cap_avg = inputBytes;
-    void *outAvg = bufferOut + off + sizeof(size_t);
-    const auto t_avg0 = high_resolution_clock::now();
-    compressMgard1D(cellAvgBuf.data(), ncells, tol_avg, outAvg, cap_avg);
-    const auto t_avg1 = high_resolution_clock::now();
-    PutParameter(bufferOut, off, cap_avg);
-    off += cap_avg;
-
-    /* ---- quantize residual and MGARD-X Huffman+ZSTD ---- */
-    const size_t markerOff = off;
-    PutParameter(bufferOut, off, (uint8_t)kResMarker_MGARDX_Huff);
-
-    /* tol_resi follows the marker so the decoder reproduces the quantum. */
-    PutParameter(bufferOut, off, tol_resi);
-
-    /* Residual backend: quantize->Huffman/ZSTD (default) or MGARD-lossy on the
-     * raw residual (residual_method=mgard / MGARD_RESIDUAL_METHOD=mgard). */
-    const bool useMgardResidual = UseMgardResidual(m_Parameters);
-
-    char *outRes = bufferOut + off + sizeof(size_t);
-    const size_t resCap = nnodes * sizeof(uint32_t) * 4 + 4096;
-    std::vector<uint32_t> quant;
-    size_t cap_res = 0;
-    auto t_q0 = high_resolution_clock::now();
-    auto t_q1 = t_q0, t_h0 = t_q0, t_h1 = t_q0;
-
-    if (!useMgardResidual)
-    {
-        /* quantize → host uint32 buffer */
-        quant.resize(nnodes);
-        t_q0 = high_resolution_clock::now();
-        if (type == DataType::Float)
-            cmg_quantize_zigzag_f32(m_Backend, reinterpret_cast<const float *>(residualBuf.data()),
-                                    nnodes, tol_resi, quant.data());
-        else
-            cmg_quantize_zigzag_f64(m_Backend, reinterpret_cast<const double *>(residualBuf.data()),
-                                    nnodes, tol_resi, quant.data());
-        t_q1 = high_resolution_clock::now();
-
-        /* MGARD-X Huffman+ZSTD on host quant buffer (SERIAL backend; same bytes on either device) */
-        t_h0 = high_resolution_clock::now();
-        cap_res = mgardx_lossless::serial::Compress(quant.data(), nnodes, outRes, resCap);
-        t_h1 = high_resolution_clock::now();
-    }
-
-#ifdef CMG_HAVE_HIP
-    /* Optional A/B measurement: also run the HIP Huffman path on the same
-     * uint32 quant buffer and log both sizes side-by-side. Enabled by
-     * env var CMG_HUFF_AB=1 (HIP build only). */
-    if (const char *ab = std::getenv("CMG_HUFF_AB");
-        !useMgardResidual && ab && *ab && *ab != '0')
-    {
-        std::vector<char> tmp(resCap);
-        const auto t_ab0 = high_resolution_clock::now();
-        size_t hip_bytes = mgardx_lossless::hip::CompressFromHost(
-            quant.data(), nnodes, tmp.data(), resCap);
-        const auto t_ab1 = high_resolution_clock::now();
-        const double ms_ser = duration<double, std::milli>(t_h1 - t_h0).count();
-        const double ms_hip = duration<double, std::milli>(t_ab1 - t_ab0).count();
-        if (m_Verbose)
-            std::cerr << "[HUFF_AB] block=" << m_BlockId
-                    << " nnodes=" << nnodes
-                    << " tol_resi=" << tol_resi
-                    << " serial_bytes=" << cap_res
-                    << " hip_bytes=" << hip_bytes
-                    << " serial_ms=" << ms_ser
-                    << " hip_ms=" << ms_hip
-                    << "\n";
-        if (const char *logp = std::getenv("CMG_HUFF_AB_LOG"); logp && *logp)
-        {
-            FILE *f = std::fopen(logp, "a");
-            if (f)
-            {
-                std::fprintf(f, "%zu,%zu,%g,%zu,%zu,%g,%g\n",
-                             (size_t)m_BlockId, nnodes, tol_resi,
-                             cap_res, hip_bytes, ms_ser, ms_hip);
-                std::fclose(f);
-            }
-        }
-    }
-#endif
-
-    uint8_t actualResMarker = kResMarker_MGARDX_Huff;
-    if (useMgardResidual || cap_res == 0)
-    {
-        /* MGARD-lossy on the raw residual: either selected explicitly, or as a
-         * fallback when the Huffman path returns 0 bytes. */
-        if (m_Verbose && !useMgardResidual)
-            std::cerr << "[centroid] block=" << m_BlockId
-                      << " MGARD-X Huffman failed; falling back to MGARD on residual\n";
-        actualResMarker = kResMarker_MGARD;
-        /* The marker byte is patched below; tol_resi was already written and is
-         * always read back by the decoder, so the field layout stays fixed
-         * ([marker][tol_resi][cap_res][payload]) regardless of which backend ran. */
-        cap_res = inputBytes;
-        t_h0 = high_resolution_clock::now();
-        compressMgard1D(residualBuf.data(), nnodes, tol_resi, outRes, cap_res);
-        t_h1 = high_resolution_clock::now();
-    }
-    *(reinterpret_cast<uint8_t *>(bufferOut + markerOff)) = actualResMarker;
-    PutParameter(bufferOut, off, cap_res);
-    off += cap_res;
-
-    const auto t1 = high_resolution_clock::now();
-    auto ms = [](auto a, auto b) {
-        return duration<double, std::milli>(b - a).count();
-    };
-    if (m_Verbose)
-        std::cerr << std::fixed << std::setprecision(2)
-                << "[centroid] block=" << m_BlockId
-                << " be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
-                << " in=" << inputBytes << " out=" << off
-                << " CR=" << (double)inputBytes / (double)off << "x"
-                << " (avg=" << cap_avg << "B res=" << cap_res << "B)"
-                << " ms[conn=" << ms(t_conn0, t_conn1)
-                << " split=" << ms(t_split0, t_split1)
-                << " sfc=" << ms(t_sfc0, t_sfc1)
-                << " mgard_avg=" << ms(t_avg0, t_avg1)
-                << " quant=" << ms(t_q0, t_q1)
-                << " huff=" << ms(t_h0, t_h1)
-                << " total=" << ms(t0, t1) << "]\n";
-    return off;
+    /* The old centroid method (cell-average + nodal-residual split, PATH A)
+     * has been retired: group_centroid and reorder_mgard supersede it on
+     * every measured field. Any method that is not one of those two is a
+     * caller error rather than a silent fallback. */
+    throw std::invalid_argument(
+        "[CompressMGARDCentroidOperator::Operate] unknown method '" +
+        MethodName(m_Parameters) +
+        "'; supported methods are 'group_centroid' (default) and 'reorder_mgard'");
 }
 
 /* ====================================================================== */
@@ -1330,19 +1303,73 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         if (!ResolveAndLoadCoords(m_Parameters, itM->second, itC->second, blockId, nx, ny, nz))
             throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
                                      "group_centroid requires coordinates");
-        const CoordGroups &cg = GetOrBuildCoordGroups(m_Backend, blockId, gmode, nx, ny, nz, nnodes);
+        const CoordGroups &cg = GetOrBuildCoordGroups(m_Backend, blockId, gmode, nx, ny, nz, nnodes,
+                                                      GroupTolerance(m_Parameters));
         if (cg.ngroups != ngroups)
             throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] rebuilt group "
                                      "count " + std::to_string(cg.ngroups) + " != bitstream " +
                                      std::to_string(ngroups));
 
-        /* coarse: MGARD decode, then undo the group SFC */
+        /* coarse: MGARD decode. Kept in group-SFC order; the recombine (device)
+         * or the host fallback undoes the group SFC. */
         void *coarseDec = nullptr;
         mgard_x::decompress(bufferIn + off, capCoarse, coarseDec, cfgC, false);
         if (coarseDec == nullptr)
             throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
                                      "group_centroid coarse decode failed");
         off += capCoarse;
+
+        /* residual header */
+        const uint8_t rSfcRaw = GetParameter<uint8_t>(bufferIn, off);
+        const cmg_sfc_t rSfc = (cmg_sfc_t)rSfcRaw;
+        const double tolR = GetParameter<double>(bufferIn, off);
+        const size_t capR = GetParameter<size_t>(bufferIn, off);
+        /* capR == 0: the encoder dropped the residual (adaptive rule) -- the
+         * coarse stream alone was already inside the residual error budget. */
+
+        /* residual codes -> host quant buffer (empty when the residual was dropped) */
+        std::vector<uint32_t> quantC;
+        if (capR > 0)
+        {
+            quantC.resize(nnodes);
+            if (!mgardx_lossless::serial::Decompress(bufferIn + off, capR, nnodes, quantC.data()))
+                throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
+                                         "group_centroid residual decode failed");
+        }
+
+        /* nodal SFC permutation for the residual (geometry, cached) */
+        const uint32_t *npermPtr = nullptr;
+        if (capR > 0 && rSfc != CMG_SFC_NONE)
+        {
+            cmg_sfc_t rebuilt;
+            const std::vector<uint32_t> &nperm =
+                GetOrBuildNodeSFCPerm(m_Backend, blockId, rSfc, nx, ny, nz, nnodes, rebuilt);
+            npermPtr = nperm.data();
+        }
+        const uint32_t *gpermPtr = (gmode != CMG_SFC_NONE) ? cg.gperm.data() : nullptr;
+        const uint32_t *quantPtr = (capR > 0) ? quantC.data() : nullptr;
+
+        /* Device-resident recombine: undo group SFC + dequant + undo nodal SFC +
+         * broadcast-add on the GPU (one H2D of inputs, one D2H of the field).
+         * Returns 0 on the CPU backend -> the staged host tail below runs. */
+        int handled = 0;
+        if (type == DataType::Float)
+            handled = cmg_group_recombine_f32(
+                m_Backend, reinterpret_cast<const float *>(coarseDec), gpermPtr, quantPtr,
+                cg.gid.data(), npermPtr, nnodes, ngroups, tolR,
+                reinterpret_cast<float *>(dataOut));
+        else
+            handled = cmg_group_recombine_f64(
+                m_Backend, reinterpret_cast<const double *>(coarseDec), gpermPtr, quantPtr,
+                cg.gid.data(), npermPtr, nnodes, ngroups, tolR,
+                reinterpret_cast<double *>(dataOut));
+        if (handled)
+        {
+            std::free(coarseDec);
+            return sizeOut;
+        }
+
+        /* -------- staged host tail (CPU backend) -------- */
         std::vector<char> coarseNat(ngroups * typeSize);
         if (gmode != CMG_SFC_NONE)
         {
@@ -1359,50 +1386,29 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
             std::memcpy(coarseNat.data(), coarseDec, ngroups * typeSize);
         std::free(coarseDec);
 
-        /* residual: entropy decode -> dequantize -> undo nodal SFC */
-        const uint8_t rSfcRaw = GetParameter<uint8_t>(bufferIn, off);
-        const cmg_sfc_t rSfc = (cmg_sfc_t)rSfcRaw;
-        const double tolR = GetParameter<double>(bufferIn, off);
-        const size_t capR = GetParameter<size_t>(bufferIn, off);
-        /* capR == 0: the encoder dropped the residual (adaptive rule) -- the
-         * coarse stream alone was already inside the residual error budget. */
         if (capR == 0)
-        {
             std::memset(dataOut, 0, nnodes * typeSize);
-            if (type == DataType::Float)
-                cmg_group_bcast_add_f32(reinterpret_cast<const float *>(coarseNat.data()),
-                                        cg.gid.data(), nnodes, reinterpret_cast<float *>(dataOut));
-            else
-                cmg_group_bcast_add_f64(reinterpret_cast<const double *>(coarseNat.data()),
-                                        cg.gid.data(), nnodes, reinterpret_cast<double *>(dataOut));
-            return sizeOut;
-        }
-
-        std::vector<uint32_t> quantC(nnodes);
-        if (!mgardx_lossless::serial::Decompress(bufferIn + off, capR, nnodes, quantC.data()))
-            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
-                                     "group_centroid residual decode failed");
-        std::vector<char> resid(nnodes * typeSize);
-        if (type == DataType::Float)
-            cmg_dequantize_zigzag_f32(m_Backend, quantC.data(), nnodes, tolR,
-                                      reinterpret_cast<float *>(resid.data()));
         else
-            cmg_dequantize_zigzag_f64(m_Backend, quantC.data(), nnodes, tolR,
-                                      reinterpret_cast<double *>(resid.data()));
-        if (rSfc != CMG_SFC_NONE)
         {
-            cmg_sfc_t rebuilt;
-            const std::vector<uint32_t> &nperm =
-                GetOrBuildNodeSFCPerm(m_Backend, blockId, rSfc, nx, ny, nz, nnodes, rebuilt);
+            std::vector<char> resid(nnodes * typeSize);
             if (type == DataType::Float)
-                cmg_perm_inverse_f32(reinterpret_cast<const float *>(resid.data()),
-                                     reinterpret_cast<float *>(dataOut), nperm.data(), nnodes);
+                cmg_dequantize_zigzag_f32(m_Backend, quantC.data(), nnodes, tolR,
+                                          reinterpret_cast<float *>(resid.data()));
             else
-                cmg_perm_inverse_f64(reinterpret_cast<const double *>(resid.data()),
-                                     reinterpret_cast<double *>(dataOut), nperm.data(), nnodes);
+                cmg_dequantize_zigzag_f64(m_Backend, quantC.data(), nnodes, tolR,
+                                          reinterpret_cast<double *>(resid.data()));
+            if (npermPtr != nullptr)
+            {
+                if (type == DataType::Float)
+                    cmg_perm_inverse_f32(reinterpret_cast<const float *>(resid.data()),
+                                         reinterpret_cast<float *>(dataOut), npermPtr, nnodes);
+                else
+                    cmg_perm_inverse_f64(reinterpret_cast<const double *>(resid.data()),
+                                         reinterpret_cast<double *>(dataOut), npermPtr, nnodes);
+            }
+            else
+                std::memcpy(dataOut, resid.data(), nnodes * typeSize);
         }
-        else
-            std::memcpy(dataOut, resid.data(), nnodes * typeSize);
 
         /* u[n] = coarse[group(n)] + resid[n] */
         if (type == DataType::Float)
@@ -1470,138 +1476,15 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         return sizeOut;
     }
 
-    const uint8_t sfcRaw  = GetParameter<uint8_t>(bufferIn, off);
-    const cmg_sfc_t sfcMode = (cmg_sfc_t)sfcRaw;
-
-    /* resolve mesh params (env fallback) */
-    if (!m_Parameters.count("meshfile"))
-        if (const char *e = std::getenv("CENTROID_MESHFILE")) m_Parameters["meshfile"] = e;
-    if (!m_Parameters.count("connectivity_variable"))
-        if (const char *e = std::getenv("CENTROID_CONN_VAR")) m_Parameters["connectivity_variable"] = e;
-    auto itMesh = m_Parameters.find("meshfile");
-    auto itConn = m_Parameters.find("connectivity_variable");
-    if (itMesh == m_Parameters.end() || itConn == m_Parameters.end())
-        throw std::invalid_argument(
-            "[CompressMGARDCentroidOperator::DecompressV5] Decompression requires meshfile + "
-            "connectivity_variable params or CENTROID_MESHFILE / CENTROID_CONN_VAR env vars");
-    const auto t_conn0 = high_resolution_clock::now();
-    const auto &conn = LoadConnectivity(itMesh->second, itConn->second, blockId);
-    const auto t_conn1 = high_resolution_clock::now();
-    if (conn.size() != ncells * npc)
-        throw std::runtime_error(
-            "[CompressMGARDCentroidOperator::DecompressV5] Connectivity length mismatch on "
-            "decompression for block " + std::to_string(blockId));
-
-    /* cell averages: MGARD decompress (SERIAL by default, HIP via
-     * MGARD_X_DEVICE_TYPE -- same policy as compression). */
-    const mgard_x::Config avgCfg = MakeMgardConfig(m_Backend);
-    const size_t cap_avg = GetParameter<size_t>(bufferIn, off);
-    void *avgOut = nullptr;
-    const auto t_avg0 = high_resolution_clock::now();
-    mgard_x::decompress(bufferIn + off, cap_avg, avgOut, avgCfg, false);
-    const auto t_avg1 = high_resolution_clock::now();
-    off += cap_avg;
-
-    /* residual: marker-dispatched */
-    const auto t_res0 = high_resolution_clock::now();
-    const uint8_t resMarker = GetParameter<uint8_t>(bufferIn, off);
-    /* tol_resi is ALWAYS written by the encoder (before the backend is chosen),
-     * so it must always be read here -- reading it conditionally misaligns the
-     * stream by 8 bytes whenever the MGARD residual path is taken. */
-    const double tol_resi = GetParameter<double>(bufferIn, off);
-    const size_t cap_res = GetParameter<size_t>(bufferIn, off);
-
-    if (resMarker == kResMarker_MGARD)
-    {
-        void *resiOut = dataOut;
-        mgard_x::decompress(bufferIn + off, cap_res, resiOut, avgCfg, true);
-    }
-    else if (resMarker == kResMarker_MGARDX_Huff)
-    {
-        std::vector<uint32_t> quant(nnodes);
-        if (!mgardx_lossless::serial::Decompress(bufferIn + off, cap_res, nnodes, quant.data()))
-            throw std::runtime_error(
-                "[CompressMGARDCentroidOperator::DecompressV5] MGARD-X Huffman decompression "
-                "failed for block " + std::to_string(blockId));
-        if (type == DataType::Float)
-            cmg_dequantize_zigzag_f32(m_Backend, quant.data(), nnodes, tol_resi,
-                                      reinterpret_cast<float *>(dataOut));
-        else
-            cmg_dequantize_zigzag_f64(m_Backend, quant.data(), nnodes, tol_resi,
-                                      reinterpret_cast<double *>(dataOut));
-    }
-    else
-    {
-        throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] Unknown residual "
-                                 "marker " + std::to_string((int)resMarker));
-    }
-    off += cap_res;
-    const auto t_res1 = high_resolution_clock::now();
-
-    /* undo SFC permutation on cell averages */
-    const auto t_sfc0 = high_resolution_clock::now();
-    if (sfcMode != CMG_SFC_NONE)
-    {
-        const double *cx = nullptr, *cy = nullptr, *cz = nullptr;
-        if (sfcMode == CMG_SFC_MORTON || sfcMode == CMG_SFC_HILBERT)
-        {
-            const bool ok = ResolveAndLoadCoords(m_Parameters, itMesh->second, itConn->second,
-                                                 blockId, cx, cy, cz);
-            if (!ok)
-                throw std::runtime_error(
-                    "[CompressMGARDCentroidOperator::DecompressV5] SFC mode requires coordinates; "
-                    "set CENTROID_COORD_PREFIX or coordinates_prefix");
-            auto vec = g_coordsCache.find({0, blockId});
-            if (vec != g_coordsCache.end() && vec->second.size() != nnodes)
-                throw std::runtime_error(
-                    "[CompressMGARDCentroidOperator::DecompressV5] Coordinate length mismatch "
-                    "for block " + std::to_string(blockId));
-        }
-        cmg_sfc_t rebuilt;
-        const std::vector<uint32_t> &perm = GetOrBuildSFCPerm(
-            m_Backend, blockId, sfcMode, conn.data(), ncells, npc, cx, cy, cz, nnodes, rebuilt);
-        if (rebuilt != sfcMode)
-            throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] Rebuilt SFC "
-                                     "mode disagrees with bitstream marker");
-        std::vector<char> unsorted(ncells * typeSize);
-        if (type == DataType::Float)
-            cmg_perm_inverse_f32(reinterpret_cast<const float *>(avgOut),
-                                 reinterpret_cast<float *>(unsorted.data()),
-                                 perm.data(), ncells);
-        else
-            cmg_perm_inverse_f64(reinterpret_cast<const double *>(avgOut),
-                                 reinterpret_cast<double *>(unsorted.data()),
-                                 perm.data(), ncells);
-        std::memcpy(avgOut, unsorted.data(), unsorted.size());
-    }
-    const auto t_sfc1 = high_resolution_clock::now();
-
-    /* recombine bar_u(n) + r(n) → u(n) */
-    const auto t_rec0 = high_resolution_clock::now();
-    if (type == DataType::Float)
-        cmg_centroid_recombine_f32(m_Backend,
-            reinterpret_cast<const float *>(avgOut), conn.data(),
-            ncells, npc, nnodes, reinterpret_cast<float *>(dataOut));
-    else
-        cmg_centroid_recombine_f64(m_Backend,
-            reinterpret_cast<const double *>(avgOut), conn.data(),
-            ncells, npc, nnodes, reinterpret_cast<double *>(dataOut));
-    const auto t_rec1 = high_resolution_clock::now();
-
-
-    if (m_Verbose)
-        std::cerr << std::fixed << std::setprecision(2) << "[centroid] block=" << blockId
-                  << " decompress be=" << (m_Backend == CMG_BACKEND_HIP ? "gpu" : "cpu")
-                  << " out=" << sizeOut << " ms[conn=" << ms(t_conn0, t_conn1)
-                  << " mgard_avg=" << ms(t_avg0, t_avg1) << " residual=" << ms(t_res0, t_res1)
-                  << " sfc=" << ms(t_sfc0, t_sfc1) << " recombine=" << ms(t_rec0, t_rec1)
-                  << " total=" << ms(t_start, high_resolution_clock::now()) << "]" << std::endl;
-
-    /* Release the MGARD-X cache so its (device) workspace is returned after each
-     * decompress, mirroring the release_cache on the compress side. */
-    mgard_x::release_cache(avgCfg);
-    std::free(avgOut);
-    return sizeOut;
+    /* PATH A (old centroid method, marked by a real ncells count) has been
+     * retired. Streams written by this build only ever use ncells == SIZE_MAX
+     * (group_centroid) or ncells == 0 (reorder_mgard), both handled above; a
+     * real ncells here is a legacy centroid-split stream this build cannot
+     * decode. */
+    throw std::runtime_error(
+        "[CompressMGARDCentroidOperator::DecompressV5] legacy centroid-split stream "
+        "(method=centroid) is no longer supported; decode with an older build or "
+        "re-compress with group_centroid / reorder_mgard");
 }
 
 } // namespace plugin

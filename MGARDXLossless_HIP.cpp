@@ -12,20 +12,32 @@
 
 #include "MGARDXLossless.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <hip/hip_runtime.h>
 
 #include <mgard/mgard-x/RuntimeX/RuntimeX.h>
 #include <mgard/mgard-x/Lossless/Lossless.hpp>
 
+extern "C" {
+std::size_t ZSTD_compress(void *dst, std::size_t dstCap, const void *src,
+                          std::size_t srcSize, int level);
+unsigned    ZSTD_isError(std::size_t code);
+const char *ZSTD_getErrorName(std::size_t code);
+}
+
 namespace mgardx_lossless {
 namespace hip {
+
+constexpr std::uint8_t kTagHuffman = 'H';
+constexpr std::uint8_t kTagZstd    = 'Z';
 
 namespace {
 
@@ -48,23 +60,14 @@ double env_double(const char *name, double def) {
   try { return std::stod(s); } catch (...) { return def; }
 }
 
-// for_ab=true: first check MGARDX_HUFF_AB_DICT (defaults to 64 — safe for
-// residual distributions that trigger degenerate Huffman at larger dict sizes).
-mgard_x::Config make_config(bool for_ab = false) {
+mgard_x::Config make_config() {
   mgard_x::Config cfg;
   cfg.dev_type               = mgard_x::device_type::HIP;
   const long lt = env_long("MGARDX_LOSSLESS", 2);
   cfg.lossless               = (lt == 0) ? mgard_x::lossless_type::Huffman
                               : (lt == 1) ? mgard_x::lossless_type::Huffman_LZ4
                                           : mgard_x::lossless_type::Huffman_Zstd;
-  // A/B calls use MGARDX_HUFF_AB_DICT (default 64) to avoid degenerate
-  // GPU Huffman code lengths (max_CL > 56) for fine-quantization residuals.
-  // Regular calls use MGARDX_HUFF_DICT (default 8192).
-  if (for_ab)
-    cfg.huff_dict_size = static_cast<mgard_x::SIZE>(
-        env_long("MGARDX_HUFF_AB_DICT", env_long("MGARDX_HUFF_DICT", 64)));
-  else
-    cfg.huff_dict_size = static_cast<mgard_x::SIZE>(env_long("MGARDX_HUFF_DICT", 8192));
+  cfg.huff_dict_size         = static_cast<mgard_x::SIZE>(env_long("MGARDX_HUFF_DICT", 8192));
   cfg.huff_block_size        = static_cast<mgard_x::SIZE>(env_long("MGARDX_HUFF_BLOCK", 1024 * 20));
   cfg.zstd_compress_level    = static_cast<int>(env_long("MGARDX_ZSTD_LEVEL", 3));
   cfg.estimate_outlier_ratio = env_double("MGARDX_OUTLIER_RATIO", 1.0);
@@ -153,38 +156,105 @@ bool Decompress(const char *h_in, std::size_t in_len,
 std::size_t CompressFromHost(const std::uint32_t *h_quant, std::size_t n,
                              char *h_out, std::size_t h_out_cap) {
   if (n == 0 || h_quant == nullptr || h_out == nullptr) return 0;
-  init_once();
+  if (h_out_cap < 2) return 0;
+  hipDeviceSynchronize();
+  (void)hipGetLastError();
 
-  const auto cfg = make_config(/*for_ab=*/true);
+  // Match serial::Compress dict (8192) so the tagged stream is serial-decodable.
+  const auto cfg = make_config();
+  const std::uint32_t max_code = *std::max_element(h_quant, h_quant + n);
+  const bool use_huffman = (max_code < static_cast<std::uint32_t>(cfg.huff_dict_size));
+  char *payload = h_out + 1; std::size_t pcap = h_out_cap - 1;
 
-  /* Let MGARD-X own the device-side input buffer (avoids passing an
-   * externally-hipMalloc'd pointer that some intermediate ops then try to
-   * copy with hipMemcpyDefault — which fails on GPUs with
-   * unifiedAddressing == 0, e.g. the Frontier login-node MI210). */
-  mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_quant(
-      {static_cast<mgard_x::SIZE>(n)});
-  arr_quant.load(h_quant);
-
-  mgard_x::Array<1, mgard_x::Byte, mgard_x::HIP> arr_compressed;
-  try {
-    mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t,
-                                        mgard_x::HIP>
-        clc(static_cast<mgard_x::SIZE>(n), cfg);
-    clc.Compress(arr_quant, arr_compressed, 0);
-    mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
-  } catch (const std::exception &e) {
-    std::cerr << "[mgardx_lossless::hip] CompressFromHost failed: "
-              << e.what() << std::endl;
-    return 0;
+  if (use_huffman) {
+    init_once();
+    mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_quant({static_cast<mgard_x::SIZE>(n)});
+    arr_quant.load(h_quant);
+    mgard_x::Array<1, mgard_x::Byte, mgard_x::HIP> arr_compressed;
+    bool ok = true;
+    try {
+      mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t, mgard_x::HIP>
+          clc(static_cast<mgard_x::SIZE>(n), cfg);
+      clc.Compress(arr_quant, arr_compressed, 0);
+      mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
+    } catch (const std::exception &e) {
+      std::cerr << "[mgardx_lossless::hip] Huffman failed (" << e.what()
+                << "), raw Zstd fallback" << std::endl;
+      ok = false;
+    }
+    if (ok) {
+      const std::size_t cb = arr_compressed.shape(0);
+      if (cb > pcap) return 0;
+      const mgard_x::Byte *pp = arr_compressed.hostCopy(false, 0);
+      mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
+      std::memcpy(payload, pp, cb);
+      h_out[0] = static_cast<char>(kTagHuffman);
+      return 1 + cb;
+    }
   }
+  const std::size_t in_bytes = n * sizeof(std::uint32_t);
+  const int level = static_cast<int>(env_long("MGARDX_ZSTD_LEVEL", 3));
+  const std::size_t got = ZSTD_compress(payload, pcap, h_quant, in_bytes, level);
+  if (ZSTD_isError(got)) { std::cerr << "[mgardx_lossless::hip] zstd err: "
+      << ZSTD_getErrorName(got) << std::endl; return 0; }
+  h_out[0] = static_cast<char>(kTagZstd);
+  return 1 + got;
+}
 
-  const std::size_t comp_bytes = arr_compressed.shape(0);
-  if (comp_bytes > h_out_cap) return 0;
+std::size_t CompressFromDevice(const std::uint32_t *d_quant, std::size_t n,
+                               std::uint32_t max_code, char *h_out,
+                               std::size_t h_out_cap) {
+  // Device-resident variant of CompressFromHost: the quantized codes are ALREADY
+  // on the GPU (from the fused pipeline), so the Huffman path consumes them
+  // in place with NO H2D. Same tagged framing as serial::Compress. max_code is
+  // supplied by the caller (device-side reduce) so the dict guard needs no D2H.
+  if (n == 0 || d_quant == nullptr || h_out == nullptr) return 0;
+  if (h_out_cap < 2) return 0;
+  hipDeviceSynchronize();
+  (void)hipGetLastError();
 
-  const mgard_x::Byte *p = arr_compressed.hostCopy(false, 0);
-  mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
-  std::memcpy(h_out, p, comp_bytes);
-  return comp_bytes;
+  const auto cfg = make_config();
+  const bool use_huffman = (max_code < static_cast<std::uint32_t>(cfg.huff_dict_size));
+  char *payload = h_out + 1; std::size_t pcap = h_out_cap - 1;
+
+  if (use_huffman) {
+    init_once();
+    // zero-copy wrap of the external DEVICE pointer (no allocation, no H2D)
+    mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_quant(
+        {static_cast<mgard_x::SIZE>(n)}, const_cast<std::uint32_t *>(d_quant));
+    mgard_x::Array<1, mgard_x::Byte, mgard_x::HIP> arr_compressed;
+    bool ok = true;
+    try {
+      mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t, mgard_x::HIP>
+          clc(static_cast<mgard_x::SIZE>(n), cfg);
+      clc.Compress(arr_quant, arr_compressed, 0);
+      mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
+    } catch (const std::exception &e) {
+      std::cerr << "[mgardx_lossless::hip] Huffman failed (" << e.what()
+                << "), raw Zstd fallback" << std::endl;
+      ok = false;
+    }
+    if (ok) {
+      const std::size_t cb = arr_compressed.shape(0);
+      if (cb > pcap) return 0;
+      const mgard_x::Byte *pp = arr_compressed.hostCopy(false, 0);
+      mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
+      std::memcpy(payload, pp, cb);
+      h_out[0] = static_cast<char>(kTagHuffman);
+      return 1 + cb;
+    }
+  }
+  // Zstd fallback (rare: max_code >= dict or Huffman overflow) -- needs host
+  // data, so D2H the codes here.
+  std::vector<std::uint32_t> h(n);
+  hipMemcpy(h.data(), d_quant, n * sizeof(std::uint32_t), hipMemcpyDeviceToHost);
+  const std::size_t in_bytes = n * sizeof(std::uint32_t);
+  const int level = static_cast<int>(env_long("MGARDX_ZSTD_LEVEL", 3));
+  const std::size_t got = ZSTD_compress(payload, pcap, h.data(), in_bytes, level);
+  if (ZSTD_isError(got)) { std::cerr << "[mgardx_lossless::hip] zstd err: "
+      << ZSTD_getErrorName(got) << std::endl; return 0; }
+  h_out[0] = static_cast<char>(kTagZstd);
+  return 1 + got;
 }
 
 } // namespace hip
