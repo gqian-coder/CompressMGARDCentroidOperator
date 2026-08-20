@@ -1,10 +1,12 @@
 /*
- * CompressMGARDCentroidOperator.cpp — V5 unified implementation.
+ * CompressMGARDCentroidOperator.cpp — V5/V6 unified implementation.
  *
  * See CompressMGARDCentroidOperator.h for the bitstream layout. This is the
  * only writer; the legacy V1..V4 read paths have been retired (drop after
- * V5 stable per Plan.md). The active path always emits V5 and InverseOperate
- * only accepts bufferVersion == 5.
+ * V5 stable per Plan.md). The active path emits V6 and InverseOperate accepts
+ * V5 and V6. V6 adds the mesh identity (connectivity variable + coordinate
+ * prefix) to the header so a stream can be decoded without CENTROID_MESHFILE
+ * / CENTROID_CONN_VAR whenever the mesh travels in the same file.
  *
  * Backend selection:
  *   - CENTROID_DEVICE=cpu (or unset on CPU build)       → CMG_BACKEND_CPU
@@ -48,12 +50,40 @@ namespace plugin
 namespace
 {
 
-constexpr uint8_t kBufferVersion = 5;
+/* V6 adds the mesh identity (connectivity variable + coordinate prefix) to the
+ * header, so a stream can name the mesh it was compressed against instead of
+ * relying on the reader's environment. V5 streams stay readable: they carry no
+ * names and fall back to CENTROID_MESHFILE / CENTROID_CONN_VAR. */
+constexpr uint8_t kBufferVersion = 6;
+constexpr uint8_t kMinBufferVersion = 5;
 
 /* First byte of the 4-byte per-operator header. Matches the value the
  * v1 (core::Operator-derived) interface wrote via MakeCommonHeader
  * (OperatorType::PLUGIN_INTERFACE), so existing V5 files stay readable. */
 constexpr uint8_t kOperatorTypeByte = 53;
+
+/* ------ length-prefixed strings in the header ------------------------ */
+/* Operator::PutParameter is a raw memcpy of a POD, so a std::string needs its
+ * own encoding: uint16 length followed by the bytes, no NUL. */
+
+void PutStr(char *buffer, size_t &pos, const std::string &s)
+{
+    const uint16_t n = (uint16_t)std::min<size_t>(s.size(), 65535);
+    std::memcpy(buffer + pos, &n, sizeof(n));
+    pos += sizeof(n);
+    std::memcpy(buffer + pos, s.data(), n);
+    pos += n;
+}
+
+std::string GetStr(const char *buffer, size_t &pos)
+{
+    uint16_t n = 0;
+    std::memcpy(&n, buffer + pos, sizeof(n));
+    pos += sizeof(n);
+    std::string s(buffer + pos, buffer + pos + n);
+    pos += n;
+    return s;
+}
 
 /* ------ env-var helpers --------------------------------------------- */
 
@@ -354,9 +384,15 @@ const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
     if (it != g_connCache.end()) return it->second;
     auto vConn = g_io_mesh.InquireVariable<int64_t>(connVar);
     if (!vConn)
+    {
+        std::cerr << "[CompressMGARDCentroidOperator] WARNING: connectivity variable '" << connVar
+                  << "' is not present in " << meshFile
+                  << ". If the mesh does not travel with the compressed data, point at it "
+                     "explicitly by setting BOTH CENTROID_MESHFILE and CENTROID_CONN_VAR.\n";
         throw std::invalid_argument(
             "[CompressMGARDCentroidOperator::LoadConnectivity] Connectivity variable '" + connVar +
             "' not found in " + meshFile);
+    }
     vConn.SetBlockSelection(blockId);
     std::vector<int64_t> conn;
     g_reader_mesh.Get<int64_t>(vConn, conn, adios2::Mode::Sync);
@@ -401,16 +437,21 @@ const std::vector<double> *TryLoadCoordsAxis(const std::string &meshFile,
     return nullptr;
 }
 
-bool ResolveAndLoadCoords(const Params &params, const std::string &meshFile,
-                          const std::string &connVar, size_t blockId,
-                          const double *&outX, const double *&outY, const double *&outZ)
+/* Where the CoordinateX/Y/Z variables live, resolved without touching the file:
+ *   1. explicit 'coordinates_prefix' param, else CENTROID_COORD_PREFIX
+ *   2. the prefix embedded in the bitstream at compress time (V6+ decode)
+ *   3. the CGNS convention: <zone>/Elem/<conn> -> <zone>/GridCoordinates/Coordinate
+ * A user override stays ahead of the embedded value so a relocated or renamed
+ * mesh can still be pointed at by hand. Returns "" if nothing resolves. */
+std::string ResolveCoordPrefix(const Params &params, const std::string &connVar,
+                               const std::string &embedded)
 {
-    outX = outY = outZ = nullptr;
     std::string prefix;
     auto it = params.find("coordinates_prefix");
     if (it != params.end()) prefix = it->second;
     if (prefix.empty())
         if (const char *e = std::getenv("CENTROID_COORD_PREFIX")) prefix = e;
+    if (prefix.empty()) prefix = embedded;
     if (prefix.empty())
     {
         const std::string token = "/Elem/";
@@ -418,6 +459,16 @@ bool ResolveAndLoadCoords(const Params &params, const std::string &meshFile,
         if (pos != std::string::npos)
             prefix = connVar.substr(0, pos) + "/GridCoordinates/Coordinate";
     }
+    return prefix;
+}
+
+bool ResolveAndLoadCoords(const Params &params, const std::string &meshFile,
+                          const std::string &connVar, size_t blockId,
+                          const double *&outX, const double *&outY, const double *&outZ,
+                          const std::string &embeddedPrefix = std::string())
+{
+    outX = outY = outZ = nullptr;
+    const std::string prefix = ResolveCoordPrefix(params, connVar, embeddedPrefix);
     if (prefix.empty()) return false;
     auto *vX = TryLoadCoordsAxis(meshFile, prefix + "X", 0, blockId);
     auto *vY = TryLoadCoordsAxis(meshFile, prefix + "Y", 1, blockId);
@@ -586,7 +637,14 @@ size_t CompressMGARDCentroidOperator::GetEstimatedSize(const size_t ElemCount,
     /* MGARD cell-avg upper bound + uint32-quant residual upper bound + header */
     const size_t mgardWorst = ElemCount * ElemSize;
     const size_t lossWorst  = ElemCount * sizeof(uint32_t) * 4 + 4096;
-    return mgardWorst + lossWorst + 1024;
+    /* the two length-prefixed header strings: connectivity variable name and
+     * coordinate prefix, the latter derived from the former */
+    size_t nameWorst = 2 * sizeof(uint16_t);
+    auto itConn = m_Parameters.find("connectivity_variable");
+    if (itConn != m_Parameters.end()) nameWorst += 2 * itConn->second.size() + 64;
+    auto itPfx = m_Parameters.find("coordinates_prefix");
+    if (itPfx != m_Parameters.end()) nameWorst += itPfx->second.size();
+    return mgardWorst + lossWorst + 1024 + nameWorst;
 }
 
 void CompressMGARDCentroidOperator::AddExtraParameters(const Params &params)
@@ -694,6 +752,15 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_MAJOR);
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_MINOR);
     PutParameter(bufferOut, off, (uint8_t)MGARD_VERSION_PATCH);
+
+    /* Mesh identity (V6+). The decoder needs the connectivity and coordinates
+     * to rebuild the grouping / SFC, and nothing in the payload identifies
+     * them. Naming them here lets a reader decode with no environment at all
+     * whenever the mesh travels in the same file as the field. Costs the two
+     * names per block; the coordinate prefix may be empty, in which case the
+     * reader falls back to the naming convention. */
+    PutStr(bufferOut, off, connVar);
+    PutStr(bufferOut, off, ResolveCoordPrefix(m_Parameters, connVar, std::string()));
 
     /* ---- relative -> absolute tolerance ----
      * Normalize the input relative 'tolerance' with a statistic of this data
@@ -1238,16 +1305,88 @@ size_t CompressMGARDCentroidOperator::InverseOperate(const char *bufferIn, const
     GetParameter<uint8_t>(bufferIn, off);                       /* operator type byte */
     const uint8_t bufferVersion = GetParameter<uint8_t>(bufferIn, off);
     off += 2;                                                   /* reserved */
-    if (bufferVersion != kBufferVersion)
+    if (bufferVersion < kMinBufferVersion || bufferVersion > kBufferVersion)
         throw std::runtime_error(
             "[CompressMGARDCentroidOperator::InverseOperate] Unsupported buffer version " +
-            std::to_string((int)bufferVersion) + " (this build only reads V" +
+            std::to_string((int)bufferVersion) + " (this build reads V" +
+            std::to_string((int)kMinBufferVersion) + ".." +
             std::to_string((int)kBufferVersion) + ")");
-    return DecompressV5(bufferIn + off, sizeIn - off, dataOut);
+    return DecompressV5(bufferIn + off, sizeIn - off, dataOut, bufferVersion);
+}
+
+/* Decide where the mesh (connectivity + coordinates) comes from for a decode
+ * and record it in m_Parameters. Precedence:
+ *
+ *   both meshfile and connectivity_variable given -> use them (external mesh)
+ *   exactly one given                             -> error, see below
+ *   neither given                                 -> self-contained: the file
+ *        being decompressed, named by m_EngineName, with the connectivity
+ *        variable embedded in the bitstream at compress time (V6+)
+ *
+ * The pair is all-or-nothing on purpose. An external mesh file and a variable
+ * name inside it are only meaningful together, so silently combining a
+ * user-supplied file with an embedded name (or a user-supplied name with the
+ * compressed file) is exactly how a decode ends up reading the wrong mesh. */
+void CompressMGARDCentroidOperator::ResolveMeshSource(const char *ctx)
+{
+    auto fromParamOrEnv = [&](const char *key, const char *env) -> std::string {
+        auto it = m_Parameters.find(key);
+        if (it != m_Parameters.end() && !it->second.empty()) return it->second;
+        if (const char *e = std::getenv(env))
+            if (*e) return std::string(e);
+        return std::string();
+    };
+    const std::string meshFile = fromParamOrEnv("meshfile", "CENTROID_MESHFILE");
+    const std::string connVar  = fromParamOrEnv("connectivity_variable", "CENTROID_CONN_VAR");
+
+    if (!meshFile.empty() && !connVar.empty())
+    {
+        m_Parameters["meshfile"]              = meshFile;
+        m_Parameters["connectivity_variable"] = connVar;
+        return;
+    }
+
+    if (meshFile.empty() != connVar.empty())
+    {
+        const char *have = meshFile.empty() ? "CENTROID_CONN_VAR" : "CENTROID_MESHFILE";
+        const char *miss = meshFile.empty() ? "CENTROID_MESHFILE" : "CENTROID_CONN_VAR";
+        std::cerr << "[CompressMGARDCentroidOperator] WARNING: " << have << " is set but " << miss
+                  << " is not. These must be set together -- an external mesh file and the "
+                     "connectivity variable inside it are only meaningful as a pair. Set both, "
+                     "or unset both to read the mesh from the compressed file itself.\n";
+        throw std::invalid_argument(std::string("[CompressMGARDCentroidOperator::") + ctx + "] " +
+                                    have + " is set without " + miss);
+    }
+
+    /* neither set: decode against the file we are reading */
+    if (m_StreamConnVar.empty())
+    {
+        std::cerr << "[CompressMGARDCentroidOperator] WARNING: this stream does not name its "
+                     "connectivity variable (written by a pre-V6 build) and neither "
+                     "CENTROID_MESHFILE nor CENTROID_CONN_VAR is set. Set both to name the mesh "
+                     "explicitly, or re-compress with this build to embed the name.\n";
+        throw std::invalid_argument(std::string("[CompressMGARDCentroidOperator::") + ctx +
+                                    "] no mesh identity in the stream and no CENTROID_MESHFILE / "
+                                    "CENTROID_CONN_VAR");
+    }
+    if (m_EngineName.empty())
+    {
+        std::cerr << "[CompressMGARDCentroidOperator] WARNING: the engine did not report the name "
+                     "of the file being read, so the mesh cannot default to it. Set both "
+                     "CENTROID_MESHFILE and CENTROID_CONN_VAR.\n";
+        throw std::invalid_argument(std::string("[CompressMGARDCentroidOperator::") + ctx +
+                                    "] engine name unavailable for a self-contained decode");
+    }
+
+    m_Parameters["meshfile"]              = m_EngineName;
+    m_Parameters["connectivity_variable"] = m_StreamConnVar;
+    if (m_Verbose)
+        std::cerr << "[CompressMGARDCentroidOperator] self-contained decode: mesh from "
+                  << m_EngineName << ", connectivity '" << m_StreamConnVar << "'\n";
 }
 
 size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const size_t /*sizeIn*/,
-                                                    char *dataOut)
+                                                    char *dataOut, const uint8_t bufferVersion)
 {
     using namespace std::chrono;
     auto ms = [](auto a, auto b) { return duration<double, std::milli>(b - a).count(); };
@@ -1263,6 +1402,16 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         " Compressed with MGARD " + std::to_string(GetParameter<uint8_t>(bufferIn, off)) + "." +
         std::to_string(GetParameter<uint8_t>(bufferIn, off)) + "." +
         std::to_string(GetParameter<uint8_t>(bufferIn, off));
+
+    /* Mesh identity, present from V6 on. V5 streams leave these empty and can
+     * only be decoded with CENTROID_MESHFILE + CENTROID_CONN_VAR. */
+    m_StreamConnVar.clear();
+    m_StreamCoordPrefix.clear();
+    if (bufferVersion >= 6)
+    {
+        m_StreamConnVar     = GetStr(bufferIn, off);
+        m_StreamCoordPrefix = GetStr(bufferIn, off);
+    }
 
     const bool isCompressed = GetParameter<bool>(bufferIn, off);
     const size_t nnodes   = blockCount[0];
@@ -1288,19 +1437,13 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         mgard_x::Config cfgC = MakeMgardConfig(m_Backend);
 
         /* rebuild the grouping from the mesh coordinates */
-        if (!m_Parameters.count("meshfile"))
-            if (const char *e = std::getenv("CENTROID_MESHFILE")) m_Parameters["meshfile"] = e;
-        if (!m_Parameters.count("connectivity_variable"))
-            if (const char *e = std::getenv("CENTROID_CONN_VAR"))
-                m_Parameters["connectivity_variable"] = e;
-        auto itM = m_Parameters.find("meshfile");
-        auto itC = m_Parameters.find("connectivity_variable");
-        if (itM == m_Parameters.end() || itC == m_Parameters.end())
-            throw std::invalid_argument("[CompressMGARDCentroidOperator::DecompressV5] "
-                                        "group_centroid requires meshfile + connectivity_variable");
-        LoadConnectivity(itM->second, itC->second, blockId);
+        ResolveMeshSource("DecompressV5/group_centroid");
+        const std::string meshFile = m_Parameters["meshfile"];
+        const std::string connVar  = m_Parameters["connectivity_variable"];
+        LoadConnectivity(meshFile, connVar, blockId);
         const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
-        if (!ResolveAndLoadCoords(m_Parameters, itM->second, itC->second, blockId, nx, ny, nz))
+        if (!ResolveAndLoadCoords(m_Parameters, meshFile, connVar, blockId, nx, ny, nz,
+                                  m_StreamCoordPrefix))
             throw std::runtime_error("[CompressMGARDCentroidOperator::DecompressV5] "
                                      "group_centroid requires coordinates");
         const CoordGroups &cg = GetOrBuildCoordGroups(m_Backend, blockId, gmode, nx, ny, nz, nnodes,
@@ -1441,23 +1584,15 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         void *out = sfcOrder.data();
         mgard_x::decompress(bufferIn + off, cap, out, cfgB, true);
 
-        if (!m_Parameters.count("meshfile"))
-            if (const char *e = std::getenv("CENTROID_MESHFILE")) m_Parameters["meshfile"] = e;
-        if (!m_Parameters.count("connectivity_variable"))
-            if (const char *e = std::getenv("CENTROID_CONN_VAR"))
-                m_Parameters["connectivity_variable"] = e;
-        auto itMeshB = m_Parameters.find("meshfile");
-        auto itConnB = m_Parameters.find("connectivity_variable");
-        if (itMeshB == m_Parameters.end() || itConnB == m_Parameters.end())
-            throw std::invalid_argument(
-                "[CompressMGARDCentroidOperator::DecompressV5] reorder_mgard requires meshfile + "
-                "connectivity_variable params or CENTROID_MESHFILE / CENTROID_CONN_VAR env vars");
+        ResolveMeshSource("DecompressV5/reorder_mgard");
+        const std::string meshFileB = m_Parameters["meshfile"];
+        const std::string connVarB  = m_Parameters["connectivity_variable"];
         /* opens the mesh reader (coords are read from the same file) */
-        LoadConnectivity(itMeshB->second, itConnB->second, blockId);
+        LoadConnectivity(meshFileB, connVarB, blockId);
 
         const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
-        if (!ResolveAndLoadCoords(m_Parameters, itMeshB->second, itConnB->second, blockId,
-                                  nx, ny, nz))
+        if (!ResolveAndLoadCoords(m_Parameters, meshFileB, connVarB, blockId,
+                                  nx, ny, nz, m_StreamCoordPrefix))
             throw std::runtime_error(
                 "[CompressMGARDCentroidOperator::DecompressV5] reorder_mgard requires coordinates; "
                 "set CENTROID_COORD_PREFIX or coordinates_prefix");

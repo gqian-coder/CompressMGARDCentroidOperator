@@ -19,7 +19,9 @@
  *   4. Quantize+zigzag residual with quantum = 2*tol_resi, tol_resi = eb*absTol
  *   5. MGARD-X Huffman+ZSTD on the uint32 residual stream         [mgard-x]
  *
- * Bitstream version 5 (this file is the only writer):
+ * Bitstream version 6 (this file is the only writer; V5 is still readable,
+ * it simply carries no mesh identity and needs CENTROID_MESHFILE +
+ * CENTROID_CONN_VAR at decode time):
  *   <ADIOS common header>
  *   size_t   blockId
  *   size_t   ndims
@@ -28,6 +30,10 @@
  *   uint8    MGARD_VERSION_MAJOR
  *   uint8    MGARD_VERSION_MINOR
  *   uint8    MGARD_VERSION_PATCH
+ *   ── V6+ only: mesh identity, so the stream can name its own mesh ──
+ *   uint16   len, bytes  connectivity variable name
+ *   uint16   len, bytes  coordinate prefix ("" => derive by convention)
+ *   ────────────────────────────────────────────────────────────────
  *   bool     isCompressed
  *   ── if !isCompressed: raw input bytes follow (below-threshold path) ─
  *   ── if isCompressed: ────────────────────────────────────────────
@@ -79,11 +85,21 @@ public:
                             const size_t ndims, const size_t *dims) const override;
 
 private:
-    size_t DecompressV5(const char *bufferIn, const size_t sizeIn, char *dataOut);
+    size_t DecompressV5(const char *bufferIn, const size_t sizeIn, char *dataOut,
+                        const uint8_t bufferVersion);
+
+    /* Pick the mesh source for a decode: an explicit meshfile +
+     * connectivity_variable pair, or the file being read plus the names
+     * embedded in the bitstream. Throws if only one of the pair is given. */
+    void ResolveMeshSource(const char *ctx);
 
     std::string m_VersionInfo;
     std::string m_MeshFile;
     std::string m_ConnVarName;
+
+    /* mesh identity carried by the bitstream (V6+); empty for V5 streams */
+    std::string m_StreamConnVar;
+    std::string m_StreamCoordPrefix;
     size_t      m_NodesPerCell = 0;
     size_t      m_BlockId = 0;
     cmg_backend_t m_Backend = CMG_BACKEND_CPU;
