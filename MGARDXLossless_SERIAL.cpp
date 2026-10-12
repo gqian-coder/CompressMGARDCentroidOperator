@@ -103,15 +103,15 @@ std::size_t Compress(const std::uint32_t *h_quant, std::size_t n,
   if (use_huffman) {
     init_once();
 
-    mgard_x::Array<1, std::uint32_t, mgard_x::SERIAL> arr_quant(
+    mgard_x::Array<1, std::int32_t, mgard_x::SERIAL> arr_quant(
         {static_cast<mgard_x::SIZE>(n)});
-    arr_quant.load(h_quant);
+    arr_quant.load(reinterpret_cast<const std::int32_t*>(h_quant));
 
     mgard_x::Array<1, mgard_x::Byte, mgard_x::SERIAL> arr_compressed;
 
     bool ok = true;
     try {
-      mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t,
+      mgard_x::ComposedLosslessCompressor<std::int32_t, std::uint64_t,
                                           mgard_x::SERIAL>
           clc(static_cast<mgard_x::SIZE>(n), cfg);
       /* Fix: outlier_count is uninitialized in the CompressPrimary path.
@@ -167,11 +167,11 @@ bool Decompress(const char *h_in, std::size_t in_len,
         {static_cast<mgard_x::SIZE>(plen)});
     arr_compressed.load(reinterpret_cast<const mgard_x::Byte *>(payload));
 
-    mgard_x::Array<1, std::uint32_t, mgard_x::SERIAL> arr_decompressed(
+    mgard_x::Array<1, std::int32_t, mgard_x::SERIAL> arr_decompressed(
         {static_cast<mgard_x::SIZE>(n)});
 
     try {
-      mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t,
+      mgard_x::ComposedLosslessCompressor<std::int32_t, std::uint64_t,
                                           mgard_x::SERIAL>
           clc(static_cast<mgard_x::SIZE>(n), cfg);
       /* Deserialize reads outlier_count from the bitstream header, so no
@@ -184,7 +184,7 @@ bool Decompress(const char *h_in, std::size_t in_len,
       return false;
     }
 
-    std::memcpy(h_quant_out, arr_decompressed.data(),
+    std::memcpy(h_quant_out, reinterpret_cast<const std::uint32_t*>(arr_decompressed.data()),
                 n * sizeof(std::uint32_t));
     return true;
   }
