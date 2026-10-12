@@ -42,41 +42,17 @@ if(ENABLE_HIP OR ENABLE_CUDA)
 endif()
 set(BUILD_SHARED_LIBS ON)
 
-# ---- imported serial MGARD (CPU-only builds) ---------------------------
-set(MGARD_SERIAL_DIR
-    "/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD-serial/install-serial"
-    CACHE PATH "Path to serial-only MGARD installation")
-add_library(mgard_serial SHARED IMPORTED GLOBAL)
-set_target_properties(mgard_serial PROPERTIES
-  IMPORTED_LOCATION             "${MGARD_SERIAL_DIR}/lib64/libmgard.so"
-  INTERFACE_INCLUDE_DIRECTORIES "${MGARD_SERIAL_DIR}/include"
-  INTERFACE_COMPILE_DEFINITIONS "MGARD_ENABLE_SERIAL=1;MGARD_ZSTD")
-
 # ------------------------------------------------------------------------
 # MGARD-X Huffman+ZSTD lossless backends.
 # ------------------------------------------------------------------------
-if(ENABLE_HIP OR ENABLE_CUDA)
-  set(_MGARDX_LOSSLESS_SERIAL_MGARD mgard::mgard)
-else()
-  set(_MGARDX_LOSSLESS_SERIAL_MGARD mgard_serial)
-endif()
-
 add_library(mgardx_lossless_serial STATIC
             MGARDXLossless_SERIAL.cpp MGARDXLossless.h)
 set_source_files_properties(MGARDXLossless_SERIAL.cpp PROPERTIES LANGUAGE CXX)
 target_include_directories(mgardx_lossless_serial PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
-# Uses Huffman+Zstd (ComposedLosslessCompressor<SERIAL>) when max_code <
-# dict_size, raw Zstd otherwise.  outlier_count uninitialized bug patched
-# in-place without modifying MGARD-X headers.
-set(ZSTD_LIBRARY "${MGARD_SERIAL_DIR}/lib/libzstd.so"
-    CACHE FILEPATH "Path to libzstd.so used by mgardx_lossless_serial")
 
-target_include_directories(mgardx_lossless_serial PRIVATE
-  "${MGARD_SERIAL_DIR}/include")
 target_link_libraries(mgardx_lossless_serial
-  PRIVATE ${_MGARDX_LOSSLESS_SERIAL_MGARD}
-          "${ZSTD_LIBRARY}")
+  PRIVATE mgard::mgard)
 set_target_properties(mgardx_lossless_serial PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
@@ -87,7 +63,7 @@ if(ENABLE_HIP)
   target_include_directories(mgardx_lossless_hip PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
   target_link_libraries(mgardx_lossless_hip
-    PRIVATE hip::device mgard::mgard "${ZSTD_LIBRARY}")
+    PRIVATE hip::device mgard::mgard)
   target_compile_definitions(mgardx_lossless_hip PRIVATE
     __HIP_PLATFORM_AMD__ ENABLE_HIP MGARDX_COMPILE_HIP)
   set_target_properties(mgardx_lossless_hip PROPERTIES
@@ -149,7 +125,7 @@ else()
   message(STATUS "CPU only ==> build CompressMGARDCentroidOperator CPU only")
   set_source_files_properties(CompressMGARDCentroidOperator.cpp PROPERTIES LANGUAGE CXX)
   target_link_libraries(CompressMGARDCentroidOperator
-    PUBLIC mgard_serial)
+    PUBLIC mgard::mgard)
 endif()
 
 include(GenerateExportHeader)
