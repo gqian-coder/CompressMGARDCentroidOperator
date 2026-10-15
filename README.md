@@ -6,6 +6,14 @@ finite-element meshes by splitting the field into a **coarse** stream and a
 
 ## Compression paths (`method` / `CENTROID_METHOD`)
 
+The MGARD stage now defaults to `s=inf` (the L-infinity error mode). An
+explicit operator parameter `s` can override it, for example `s=0` to
+reproduce an older benchmark. MGARD 1.7's default MultiDim decomposition is
+used unless `CENTROID_MGARD_DECOMPOSITION=hybrid` selects its hybrid hierarchy;
+`default` or `multidim` selects MultiDim explicitly. This setting applies to
+MGARD's coarse stream in `group_centroid` and to the full field in
+`reorder_mgard`; it does not change the centroid residual coder.
+
 ### `group_centroid` (default)
 
 Exploits the fact that the nodal field stores each *distinct* coordinate
@@ -127,8 +135,9 @@ By default the operator does not print anything. Logs go to stderr.
 | `connectivity_variable` | `CENTROID_CONN_VAR`     | compress | Full name of the int64 connectivity variable, e.g. `/volume/Elem/ElementConnectivity`. On decompress this is optional — see below. |
 | `nodes_per_cell`        | —                       | yes | `8` for `HEXA_8`, `4` for `QUAD_4`/`TETRA_4`, `3` for `TRI_3`, ... |
 | `blockid`               | —                       | yes | Index of the block being compressed (set per `Put`). |
-| `tolerance`             | —                       | yes | Absolute error bound for the reconstructed field. |
-| `mode`                  | —                       | no  | Only `"ABS"` is supported (caller must convert REL→ABS). |
+| `tolerance`             | —                       | yes | Relative tolerance, converted to an absolute budget using the selected normalization. |
+| `mode`                  | —                       | no  | `REL_L2` (default) normalizes by the block RMS value; `REL_VAL` normalizes by the block range or supplied `normalization_range`. |
+| `normalization_range`   | —                       | no  | With `mode=REL_VAL`, use this finite, nonnegative timestep-wide range instead of each block's range: `abs_tol = tolerance * normalization_range`. A zero range stores raw data. |
 | `method`                | `CENTROID_METHOD`       | no  | `group_centroid` (default) or `reorder_mgard`. |
 | `sfc_type`              | `CENTROID_SFC_TYPE`     | no  | `hilbert` (default), `morton`/`z`, or `minnode`. |
 | `residual_sfc`          | `CENTROID_RESID_SFC`    | no  | Nodal SFC reorder of the residual before entropy coding. Default on. |
@@ -138,14 +147,14 @@ By default the operator does not print anything. Logs go to stderr.
 | `fused`                 | `CENTROID_FUSED`        | no  | Fused split/quantize kernels. |
 | `device_resident`       | `CENTROID_DEVRESIDENT`  | no  | Keep block geometry resident on device across a block's variables. |
 | `hip_lossless`          | `CENTROID_HIP_LOSSLESS` | no  | Use the HIP lossless (Huffman) path. |
-| `ebratio`               | —                       | no  | Fraction of the budget for the residual. Default `0.8`; `tol_resi = ebratio*tolerance`, `tol_avg = (1-ebratio)*tolerance`. |
-| `s`                     | —                       | no  | MGARD `s` (smoothness). Default `0`. |
+| `ebratio`               | —                       | no  | Fraction of the absolute budget for the residual. Default `0.8`; `tol_resi = ebratio*abs_tol`, `tol_avg = (1-ebratio)*abs_tol`. |
+| `s`                     | —                       | no  | MGARD `s` (smoothness). Default `inf`. |
 | `threshold`             | —                       | no  | Skip compression for blocks smaller than this many bytes. Default `100000`. |
 
 ## Finding the mesh at decompress time
 
 Decoding needs the mesh: both `group_centroid` and `reorder_mgard` rebuild the
-coordinate grouping / SFC permutation from the connectivity and coordinates
+coordinate grouping / SFC permutation from the coordinates
 rather than storing them, which is what makes the reordering cost zero bytes.
 Nothing in the payload itself identifies that mesh, so it has to be named.
 
@@ -171,8 +180,24 @@ V5 streams (written before this change) carry no names and can only be decoded
 in external-mesh mode; the operator says so explicitly if both env vars are
 missing. This build reads V5 and V6 and writes V6.
 
+## Geometry cache lifetime
+
+The operator retains geometry for one active block per process. Process every
+variable of a block before moving to the next block to reuse its coordinates,
+grouping, and SFC permutations. Advancing to another block releases all previous
+host geometry and cached HIP `gid`, `gperm`, and `nperm` allocations. This policy
+also bounds memory for variable-major clients, although they rebuild geometry
+when revisiting a block. It applies to compression and decompression, including
+transitions to raw blocks. Coordinate-only methods open the mesh reader without
+reading connectivity. Complete operator calls are serialized within a process
+to keep cached geometry alive while a call uses it.
+
 Additional runtime knobs: `CENTROID_DEVICE` (`cpu`/`hip`), `CENTROID_VERBOSE`,
-`CENTROID_DEBUG`, `MGARD_X_DEVICE_TYPE`, `MGARDX_HUFF_BLOCK`, `MGARDX_HUFF_DICT`.
+`CENTROID_DEBUG`, `MGARD_X_DEVICE_TYPE`, `MGARDX_HUFF_BLOCK`, `MGARDX_HUFF_DICT`,
+and `MGARD_MAX_LEVEL`, the number of global decomposition levels of the MGARD
+stage at compression time: unset = 4, an integer N = at most N levels, `full` =
+the natural depth, `default` = MGARD's own default (3). MGARD 1.7 (PR 262)
+stores this value in the stream, so decompression needs no setting.
 
 Reconstruction error bound (informal):
 `|u_recon - u| <= tol_avg + tol_resi = tolerance`. A formal proof (using the

@@ -134,7 +134,7 @@ size_t cmg_build_coord_groups(cmg_backend_t be,
  * Runs group mean -> coarse SFC -> open-loop residual -> stats -> residual SFC
  * -> quantize all on the GPU, uploading the field once and returning only the
  * small coarse stream, the quantized codes and the stats. Geometry (gid,gperm,
- * nperm) is device-cached per blockId. Returns 1 if it ran on the GPU, 0 if the
+ * nperm) is device-cached for the active blockId. Returns 1 if it ran on the GPU, 0 if the
  * caller must fall back to the staged CPU path (non-HIP backend). gperm/nperm
  * may be null to skip the corresponding SFC reorder. quantC is written only
  * when *drop == 0 (adaptive rule kept the residual).
@@ -156,6 +156,13 @@ int cmg_group_compress_f64(cmg_backend_t be, size_t blockId, const double *field
     double *coarseSfc, double *rmin, double *rmax, double *rsumsq,
     int *drop, uint32_t *quantC,
     void **d_coarse_out, void **d_q_out, uint32_t *maxcode);
+
+/* Release cached device geometry when the operator advances to another block.
+ * Waits for an in-flight fused call to finish before freeing its geometry.
+ * The HIP implementation frees each allocation on its owning device; CPU-only
+ * builds provide a no-op. Per-field buffers returned above belong to the caller
+ * and are unaffected. */
+void cmg_evict_geometry_cache(void);
 
 /* Device-resident decompress recombine: undo group SFC on the coarse stream,
  * dequantize the residual, undo the nodal SFC, and add the group-broadcast mean

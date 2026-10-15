@@ -331,8 +331,13 @@ inline size_t CompressResidualCodes(cmg_backend_t be, const Params &params,
     return mgardx_lossless::serial::Compress(quant, n, dst, cap);
 }
 
-/* ------ per-process mesh cache (connectivity + coords) -------------- */
+/* ------ per-process active-block geometry cache --------------------- */
 
+/* Geometry helpers return references into the caches. Serialize complete
+ * operator calls so another thread cannot evict them while they are in use.
+ * Lock order is operation -> mesh -> device geometry, never the reverse. */
+std::mutex                                                  g_operationMutex;
+size_t                                                      g_operatorInstances = 0;
 std::mutex                                                  g_meshMutex;
 std::string                                                 g_meshFileName;
 std::string                                                 g_connVarName;
@@ -341,10 +346,9 @@ adios2::IO                                                  g_io_mesh;
 adios2::Engine                                              g_reader_mesh;
 std::map<size_t, std::vector<int64_t>>                      g_connCache;
 std::map<std::pair<int, size_t>, std::vector<double>>       g_coordsCache;
-/* Nodal SFC permutation cache, keyed by block id. The mesh (connectivity +
- * coords) is time- and variable-invariant within a process, so the permutation
- * is identical for every variable/timestep of a block; caching it avoids
- * rebuilding the Hilbert sort on every (de)compress call. */
+/* Geometry is reused by consecutive variables of the active block. Moving to
+ * another block evicts the old vectors, keeping memory independent of the
+ * number of assigned blocks, including for variable-major clients. */
 std::map<size_t, std::vector<uint32_t>>                     g_nodePermCache;
 std::map<size_t, cmg_sfc_t>                                 g_nodePermMode;
 /* Coordinate-group cache (group_centroid path): gid per node, the group count,
@@ -358,9 +362,54 @@ struct CoordGroups
     cmg_sfc_t             gmode = CMG_SFC_NONE;
 };
 std::map<size_t, CoordGroups>                               g_groupCache;
+bool                                                        g_hasActiveBlock = false;
+size_t                                                      g_activeBlock = 0;
 
-const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
-                                             const std::string &connVar, size_t blockId)
+/* Caller holds g_meshMutex. clear() destroys each vector and releases its
+ * storage, rather than merely resetting sizes while retaining capacity. */
+void EvictGeometryLocked()
+{
+    cmg_evict_geometry_cache();
+    g_connCache.clear();
+    g_coordsCache.clear();
+    g_nodePermCache.clear();
+    g_nodePermMode.clear();
+    g_groupCache.clear();
+    g_hasActiveBlock = false;
+}
+
+/* Invoked for every compression/decompression, even raw blocks that need no
+ * mesh. The caller keeps g_operationMutex held until all cache references and
+ * device geometry from this call are no longer in use. */
+void SelectActiveBlock(size_t blockId)
+{
+    std::lock_guard<std::mutex> lck(g_meshMutex);
+    if (g_hasActiveBlock && g_activeBlock == blockId) return;
+    EvictGeometryLocked();
+    g_activeBlock = blockId;
+    g_hasActiveBlock = true;
+}
+
+/* ADIOS can replace a variable's operator while other variables still use the
+ * shared reader/cache. Only the final instance owns process-cache teardown. */
+void RegisterOperatorInstance()
+{
+    std::lock_guard<std::mutex> operation(g_operationMutex);
+    ++g_operatorInstances;
+}
+
+void UnregisterOperatorInstance()
+{
+    std::lock_guard<std::mutex> operation(g_operationMutex);
+    if (--g_operatorInstances != 0) return;
+    std::lock_guard<std::mutex> mesh(g_meshMutex);
+    EvictGeometryLocked();
+    if (g_reader_mesh) g_reader_mesh.Close();
+}
+
+/* Reader initialization does not read connectivity. Coordinate-only methods
+ * still preserve the mesh-file/connectivity-name identity check. */
+void EnsureMeshReader(const std::string &meshFile, const std::string &connVar)
 {
     std::lock_guard<std::mutex> lck(g_meshMutex);
     if (!g_reader_mesh)
@@ -377,9 +426,16 @@ const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
     else if (g_meshFileName != meshFile || g_connVarName != connVar)
     {
         throw std::invalid_argument(
-            "[CompressMGARDCentroidOperator::LoadConnectivity] "
+            "[CompressMGARDCentroidOperator::EnsureMeshReader] "
             "Mesh-file/connectivity-variable cannot change between calls in the same process");
     }
+}
+
+const std::vector<int64_t> &LoadConnectivity(const std::string &meshFile,
+                                             const std::string &connVar, size_t blockId)
+{
+    EnsureMeshReader(meshFile, connVar);
+    std::lock_guard<std::mutex> lck(g_meshMutex);
     auto it = g_connCache.find(blockId);
     if (it != g_connCache.end()) return it->second;
     auto vConn = g_io_mesh.InquireVariable<int64_t>(connVar);
@@ -551,6 +607,22 @@ mgard_x::Config MakeMgardConfig(cmg_backend_t be)
 {
     mgard_x::Config cfg;
     cfg.lossless = mgard_x::lossless_type::Huffman_Zstd;
+    /* MGARD-X caches one hierarchy per distinct block shape and never evicts.
+     * A P5 rank sees hundreds of distinct shapes, so without release the device
+     * hierarchies would accumulate; release after every compress/decompress. */
+    cfg.auto_cache_release = true;
+    /* MGARD 1.7 defaults to MultiDim.  Select its hybrid hierarchy for
+     * comparisons without changing the centroid split or error budget. */
+    if (const char *e = std::getenv("CENTROID_MGARD_DECOMPOSITION"); e && *e)
+    {
+        std::string mode(e);
+        for (auto &c : mode) c = (char)std::tolower((unsigned char)c);
+        if (mode == "hybrid")
+            cfg.decomposition = mgard_x::decomposition_type::Hybrid;
+        else if (mode != "default" && mode != "multidim")
+            throw std::invalid_argument("CENTROID_MGARD_DECOMPOSITION must be "
+                                        "default, multidim, or hybrid");
+    }
     /* Default the internal MGARD to match the compute backend: on HIP the coarse
      * stream stays device-resident (the fused pipeline hands MGARD its on-device
      * pointer, which MGARD-X detects and compresses in place -- no H2D), so GPU
@@ -592,6 +664,32 @@ mgard_x::Config MakeMgardConfig(cmg_backend_t be)
     return cfg;
 }
 
+/* Number of global decomposition levels for the MGARD stage, compression only:
+ * MGARD stores it in the stream and uses it when decompressing.  MGARD_MAX_LEVEL:
+ * not set = kDefaultMaxLevel, N = at most N levels, "full" = the natural depth,
+ * "default" = MGARD's own default (3). */
+constexpr mgard_x::SIZE kDefaultMaxLevel = 4;
+
+void ApplyMgardLevelCap(mgard_x::Config &cfg)
+{
+    const char *e = std::getenv("MGARD_MAX_LEVEL");
+    const std::string level = (e && *e) ? std::string(e) : "";
+    if (level.empty())
+        cfg.num_global_refactoring_level = kDefaultMaxLevel;
+    else if (level == "full")
+        cfg.num_global_refactoring_level = std::numeric_limits<mgard_x::SIZE>::max();
+    else if (level != "default")
+    {
+        if (level.find_first_not_of("0123456789") != std::string::npos)
+            throw std::invalid_argument(
+                "MGARD_MAX_LEVEL must be full, default or a positive integer");
+        const auto cap = std::stoull(level);
+        if (cap == 0 || cap > std::numeric_limits<mgard_x::SIZE>::max())
+            throw std::invalid_argument("MGARD_MAX_LEVEL is outside MGARD's positive level range");
+        cfg.num_global_refactoring_level = static_cast<mgard_x::SIZE>(cap);
+    }
+}
+
 } // anonymous namespace
 
 /* ====================================================================== */
@@ -618,11 +716,12 @@ CompressMGARDCentroidOperator::CompressMGARDCentroidOperator(const Params &param
         if (m_Verbose)
             std::cerr << "[centroid] CENTROID_DEVICE=cpu\n";
     }
+    RegisterOperatorInstance();
 }
 
 CompressMGARDCentroidOperator::~CompressMGARDCentroidOperator()
 {
-    if (g_reader_mesh) g_reader_mesh.Close();
+    UnregisterOperatorInstance();
 }
 
 bool CompressMGARDCentroidOperator::IsDataTypeValid(const DataType type) const
@@ -662,6 +761,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                                               const Dims &blockCount, const DataType type,
                                               char *bufferOut)
 {
+    std::lock_guard<std::mutex> operation(g_operationMutex);
     using namespace std::chrono;
     const auto t0 = high_resolution_clock::now();
 
@@ -683,6 +783,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
     std::string connVar = need("connectivity_variable");
     m_NodesPerCell     = std::stoul(need("nodes_per_cell"));
     m_BlockId          = std::stoul(need("blockid"));
+    SelectActiveBlock(m_BlockId);
 
     double tolerance = 0.0;
     bool   hasTol = false;
@@ -725,7 +826,23 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
                     "mode is supported");
         }
     }
-    double s = 0.0;
+    /* Drivers can prescribe one timestep-wide range for every block. Leaving
+     * this parameter absent retains the existing block-local normalization. */
+    bool hasNormalizationRange = false;
+    double normalizationRange = 0.0;
+    {
+        auto it = m_Parameters.find("normalization_range");
+        if (it != m_Parameters.end())
+        {
+            if (relMode != RelMode::VAL)
+                throw std::invalid_argument("normalization_range requires mode REL_VAL");
+            normalizationRange = std::stod(it->second);
+            if (!std::isfinite(normalizationRange) || normalizationRange < 0.0)
+                throw std::invalid_argument("normalization_range must be finite and nonnegative");
+            hasNormalizationRange = true;
+        }
+    }
+    double s = std::numeric_limits<double>::infinity();
     {
         auto it = m_Parameters.find("s");
         if (it != m_Parameters.end()) s = std::stod(it->second);
@@ -767,7 +884,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
      * block; the min/max and sum-of-squares are computed on the GPU when the
      * backend is HIP (else on the CPU). Only needed when we actually compress. */
     double vmin = 0.0, vmax = 0.0, sumsq = 0.0;
-    if (inputBytes >= thresholdSize)
+    if (inputBytes >= thresholdSize && !hasNormalizationRange)
     {
         if (type == DataType::Float)
             cmg_reduce_stats_f32(m_Backend, reinterpret_cast<const float *>(dataIn), nnodes,
@@ -781,7 +898,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
      * scale consistent with the L-inf residual quantizer. */
     const double normFactor = (relMode == RelMode::L2)
                                   ? std::sqrt(sumsq / static_cast<double>(nnodes))
-                                  : (vmax - vmin);
+                                  : (hasNormalizationRange ? normalizationRange : vmax - vmin);
     const double absTol = tolerance * normFactor;
 
     /* Raw storage for tiny blocks or a degenerate normalization: a constant /
@@ -837,7 +954,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
 
         /* --- coordinates + grouping (cached, geometry-only) --- */
         const auto t_grp0 = high_resolution_clock::now();
-        LoadConnectivity(m_MeshFile, connVar, m_BlockId);   /* opens mesh reader */
+        EnsureMeshReader(m_MeshFile, connVar);
         const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
         if (!ResolveAndLoadCoords(m_Parameters, m_MeshFile, connVar, m_BlockId, nx, ny, nz))
             throw std::runtime_error("[CompressMGARDCentroidOperator::Operate] group_centroid "
@@ -897,6 +1014,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
              * codes. Otherwise fall back to host buffers. */
             const mgard_x::data_type mgTypeC = ToMgardType(type);
             mgard_x::Config cfgC = MakeMgardConfig(m_Backend);
+            ApplyMgardLevelCap(cfgC);
             const bool devResident =
                 (cfgC.dev_type == mgard_x::device_type::HIP) && IsHipLosslessEnabled(m_Parameters)
                 && IsDeviceResidentEnabled(m_Parameters);
@@ -1044,6 +1162,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         /* --- MGARD the coarse stream --- */
         const mgard_x::data_type mgTypeC = ToMgardType(type);
         mgard_x::Config cfgC = MakeMgardConfig(m_Backend);
+        ApplyMgardLevelCap(cfgC);
         std::vector<mgard_x::SIZE> shapeC = { (mgard_x::SIZE)ngroups };
         void *mgOut = nullptr; size_t mgSize = 0;
         const auto t_mg0 = high_resolution_clock::now();
@@ -1206,11 +1325,8 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
         auto t_perm1 = t_perm0, t_gat0 = t_perm0, t_gat1 = t_perm0;
         const auto t_g0 = t_perm0;
         {
-            /* The coordinate loader reads through the shared mesh reader, which
-             * is opened lazily by LoadConnectivity. This path does not otherwise
-             * need the connectivity, but must open the reader before asking for
-             * coords (result is cached, so this is a no-op after block 0). */
-            LoadConnectivity(m_MeshFile, connVar, m_BlockId);
+            /* Open the shared reader without loading unused connectivity. */
+            EnsureMeshReader(m_MeshFile, connVar);
 
             const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
             bool haveCoords =
@@ -1251,6 +1367,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
 
         const mgard_x::data_type mgardTypeB = ToMgardType(type);
         mgard_x::Config cfgB = MakeMgardConfig(m_Backend);
+        ApplyMgardLevelCap(cfgB);
         std::vector<mgard_x::SIZE> shapeB = { (mgard_x::SIZE)nnodes };
         void *mgardOut = nullptr; size_t mgardSize = 0;
         const auto t_m0 = high_resolution_clock::now();
@@ -1301,6 +1418,7 @@ size_t CompressMGARDCentroidOperator::Operate(const char *dataIn, const Dims & /
 size_t CompressMGARDCentroidOperator::InverseOperate(const char *bufferIn, const size_t sizeIn,
                                                      char *dataOut)
 {
+    std::lock_guard<std::mutex> operation(g_operationMutex);
     size_t off = 0;
     GetParameter<uint8_t>(bufferIn, off);                       /* operator type byte */
     const uint8_t bufferVersion = GetParameter<uint8_t>(bufferIn, off);
@@ -1393,6 +1511,7 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
     const auto t_start = high_resolution_clock::now();
     size_t off = 0;
     const size_t blockId = GetParameter<size_t>(bufferIn, off);
+    SelectActiveBlock(blockId);
     const size_t ndims   = GetParameter<size_t, size_t>(bufferIn, off);
     Dims blockCount(ndims);
     for (size_t i = 0; i < ndims; ++i)
@@ -1440,7 +1559,7 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         ResolveMeshSource("DecompressV5/group_centroid");
         const std::string meshFile = m_Parameters["meshfile"];
         const std::string connVar  = m_Parameters["connectivity_variable"];
-        LoadConnectivity(meshFile, connVar, blockId);
+        EnsureMeshReader(meshFile, connVar);
         const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
         if (!ResolveAndLoadCoords(m_Parameters, meshFile, connVar, blockId, nx, ny, nz,
                                   m_StreamCoordPrefix))
@@ -1588,7 +1707,7 @@ size_t CompressMGARDCentroidOperator::DecompressV5(const char *bufferIn, const s
         const std::string meshFileB = m_Parameters["meshfile"];
         const std::string connVarB  = m_Parameters["connectivity_variable"];
         /* opens the mesh reader (coords are read from the same file) */
-        LoadConnectivity(meshFileB, connVarB, blockId);
+        EnsureMeshReader(meshFileB, connVarB);
 
         const double *nx = nullptr, *ny = nullptr, *nz = nullptr;
         if (!ResolveAndLoadCoords(m_Parameters, meshFileB, connVarB, blockId,

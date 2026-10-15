@@ -1,8 +1,11 @@
-# build + generated test outputs (multi-GB .bp trees)
+# build trees, local installs and generated test outputs (multi-GB .bp trees)
 build*/
+install*/
+*.bp/
+*.log
+core
 nsfc_smoke/
 nsfc_test*/
 path_test/
 test_out/
-*.bp/
-*.log
+tests/__pycache__/

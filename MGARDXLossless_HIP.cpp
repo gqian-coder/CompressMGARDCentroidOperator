@@ -84,13 +84,13 @@ std::size_t Compress(const std::uint32_t *d_quant, std::size_t n,
   const auto cfg = make_config();
 
   /* Wrap the external device pointer (zero-copy, no free on dtor). */
-  mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_quant(
+  mgard_x::Array<1, std::int32_t, mgard_x::HIP> arr_quant(
       {static_cast<mgard_x::SIZE>(n)},
-      const_cast<std::uint32_t *>(d_quant));
+      reinterpret_cast<std::int32_t *>(const_cast<std::uint32_t *>(d_quant)));
 
   mgard_x::Array<1, mgard_x::Byte, mgard_x::HIP> arr_compressed;
   try {
-    mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t,
+    mgard_x::ComposedLosslessCompressor<std::int32_t, std::uint64_t,
                                         mgard_x::HIP>
         clc(static_cast<mgard_x::SIZE>(n), cfg);
     clc.Compress(arr_quant, arr_compressed, 0);
@@ -126,11 +126,11 @@ bool Decompress(const char *h_in, std::size_t in_len,
 
   /* Let MGARD-X allocate its own decompressed buffer (safer than passing
    * an external pointer because DecompressPrimary may reshape). */
-  mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_decompressed(
+  mgard_x::Array<1, std::int32_t, mgard_x::HIP> arr_decompressed(
       {static_cast<mgard_x::SIZE>(n)});
 
   try {
-    mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t,
+    mgard_x::ComposedLosslessCompressor<std::int32_t, std::uint64_t,
                                         mgard_x::HIP>
         clc(static_cast<mgard_x::SIZE>(n), cfg);
     clc.Decompress(arr_compressed, arr_decompressed, 0);
@@ -142,7 +142,7 @@ bool Decompress(const char *h_in, std::size_t in_len,
   }
 
   /* Device-to-device copy into caller's external buffer. */
-  const std::uint32_t *src = arr_decompressed.data();
+  const std::int32_t *src = arr_decompressed.data();
   hipError_t err = hipMemcpy(d_quant_out, src, n * sizeof(std::uint32_t),
                              hipMemcpyDeviceToDevice);
   if (err != hipSuccess) {
@@ -168,12 +168,12 @@ std::size_t CompressFromHost(const std::uint32_t *h_quant, std::size_t n,
 
   if (use_huffman) {
     init_once();
-    mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_quant({static_cast<mgard_x::SIZE>(n)});
-    arr_quant.load(h_quant);
+    mgard_x::Array<1, std::int32_t, mgard_x::HIP> arr_quant({static_cast<mgard_x::SIZE>(n)});
+    arr_quant.load(reinterpret_cast<const std::int32_t *>(h_quant));
     mgard_x::Array<1, mgard_x::Byte, mgard_x::HIP> arr_compressed;
     bool ok = true;
     try {
-      mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t, mgard_x::HIP>
+      mgard_x::ComposedLosslessCompressor<std::int32_t, std::uint64_t, mgard_x::HIP>
           clc(static_cast<mgard_x::SIZE>(n), cfg);
       clc.Compress(arr_quant, arr_compressed, 0);
       mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);
@@ -220,12 +220,13 @@ std::size_t CompressFromDevice(const std::uint32_t *d_quant, std::size_t n,
   if (use_huffman) {
     init_once();
     // zero-copy wrap of the external DEVICE pointer (no allocation, no H2D)
-    mgard_x::Array<1, std::uint32_t, mgard_x::HIP> arr_quant(
-        {static_cast<mgard_x::SIZE>(n)}, const_cast<std::uint32_t *>(d_quant));
+    mgard_x::Array<1, std::int32_t, mgard_x::HIP> arr_quant(
+        {static_cast<mgard_x::SIZE>(n)},
+        reinterpret_cast<std::int32_t *>(const_cast<std::uint32_t *>(d_quant)));
     mgard_x::Array<1, mgard_x::Byte, mgard_x::HIP> arr_compressed;
     bool ok = true;
     try {
-      mgard_x::ComposedLosslessCompressor<std::uint32_t, std::uint64_t, mgard_x::HIP>
+      mgard_x::ComposedLosslessCompressor<std::int32_t, std::uint64_t, mgard_x::HIP>
           clc(static_cast<mgard_x::SIZE>(n), cfg);
       clc.Compress(arr_quant, arr_compressed, 0);
       mgard_x::DeviceRuntime<mgard_x::HIP>::SyncQueue(0);

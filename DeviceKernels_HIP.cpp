@@ -434,24 +434,46 @@ void reduce_stats_dev(const T *d_in, size_t n,
 /* ---- per-block geometry, cached on the DEVICE ---------------------- */
 /* gid / gperm / nperm are geometry-only (depend on the mesh, not the field), so
  * they are uploaded once per block and reused across all variables/timesteps of
- * that block -- the core of the device-resident pipeline. Keyed by blockId, held
- * for the process lifetime (freed implicitly at exit). */
+ * that block -- the core of the device-resident pipeline. Only the active block
+ * is retained, and allocations are freed when the operator changes blocks. */
 struct GeomDev {
     uint32_t *gid   = nullptr;   /* nnodes  */
     uint32_t *gperm = nullptr;   /* ngroups, null if group SFC disabled  */
     uint32_t *nperm = nullptr;   /* nnodes,  null if residual SFC disabled */
     size_t    nnodes = 0, ngroups = 0;
+    int       device = 0;
 };
 std::mutex g_geomMutex;
 std::unordered_map<size_t, GeomDev> g_geomCache;
 
-const GeomDev &get_geom_dev(size_t blockId, const uint32_t *gid, const uint32_t *gperm,
+/* Caller holds g_geomMutex, including throughout kernels using the pointers. */
+void free_geom_dev(GeomDev &G)
+{
+    int previousDevice = 0;
+    HIP_OK(hipGetDevice(&previousDevice));
+    if (previousDevice != G.device) HIP_OK(hipSetDevice(G.device));
+    if (G.gid)   HIP_OK(hipFree(G.gid));
+    if (G.gperm) HIP_OK(hipFree(G.gperm));
+    if (G.nperm) HIP_OK(hipFree(G.nperm));
+    if (previousDevice != G.device) HIP_OK(hipSetDevice(previousDevice));
+    G = GeomDev{};
+}
+
+void evict_geom_dev_locked()
+{
+    for (auto &entry : g_geomCache) free_geom_dev(entry.second);
+    g_geomCache.clear();
+}
+
+const GeomDev &get_geom_dev_locked(size_t blockId, const uint32_t *gid, const uint32_t *gperm,
                             const uint32_t *nperm, size_t nnodes, size_t ngroups)
 {
-    std::lock_guard<std::mutex> lk(g_geomMutex);
+    int device = 0;
+    HIP_OK(hipGetDevice(&device));
     auto it = g_geomCache.find(blockId);
     if (it != g_geomCache.end() &&
-        it->second.nnodes == nnodes && it->second.ngroups == ngroups)
+        it->second.nnodes == nnodes && it->second.ngroups == ngroups &&
+        it->second.device == device)
     {
         GeomDev &G = it->second;
         /* nperm may arrive on a later variable than the one that first built the
@@ -462,7 +484,10 @@ const GeomDev &get_geom_dev(size_t blockId, const uint32_t *gid, const uint32_t 
         }
         return G;
     }
-    GeomDev G; G.nnodes = nnodes; G.ngroups = ngroups;
+    /* Also bound direct users of the low-level fused ABI, and replace a stale
+     * same-block entry rather than leaking new allocations through emplace. */
+    evict_geom_dev_locked();
+    GeomDev G; G.nnodes = nnodes; G.ngroups = ngroups; G.device = device;
     HIP_OK(hipMalloc(&G.gid, nnodes * sizeof(uint32_t)));
     HIP_OK(hipMemcpy(G.gid, gid, nnodes * sizeof(uint32_t), hipMemcpyHostToDevice));
     if (gperm) {
@@ -480,7 +505,7 @@ const GeomDev &get_geom_dev(size_t blockId, const uint32_t *gid, const uint32_t 
 /* One H2D of the field; group mean, coarse SFC, open-loop residual, stats,
  * residual SFC and quantize all run device-resident. Only the small coarse
  * stream (-> CPU MGARD), the quantized codes (-> CPU Huffman) and the stats
- * come back. Geometry is device-cached via get_geom_dev. */
+ * come back. Geometry is device-cached via get_geom_dev_locked. */
 /* If d_coarse_out / d_q_out are non-null the corresponding buffer is kept on
  * the DEVICE and returned (the caller frees it via cmg_hip_free) -- the coarse
  * goes straight to MGARD-HIP and the codes straight to hip::CompressFromDevice
@@ -495,7 +520,10 @@ void group_compress_hip(size_t blockId, const T *h_field, const uint32_t *h_gid,
                         double *out_rsumsq, int *out_drop, uint32_t *h_quantC,
                         void **d_coarse_out, void **d_q_out, uint32_t *out_maxcode)
 {
-    const GeomDev &G = get_geom_dev(blockId, h_gid, h_gperm, h_nperm, nnodes, ngroups);
+    /* Keep the cache lock until all kernels using geometry finish, so an
+     * eviction from another thread cannot invalidate these device pointers. */
+    std::lock_guard<std::mutex> geometryUse(g_geomMutex);
+    const GeomDev &G = get_geom_dev_locked(blockId, h_gid, h_gperm, h_nperm, nnodes, ngroups);
     const bool devResident = (d_coarse_out != nullptr) || (d_q_out != nullptr);
 
     T *d_field = nullptr, *d_coarse = nullptr, *d_resid = nullptr;
@@ -669,6 +697,12 @@ int cmg_hip_available(void)
 {
     int n = 0;
     return (hipGetDeviceCount(&n) == hipSuccess && n > 0) ? 1 : 0;
+}
+
+void cmg_hip_evict_geometry_cache(void)
+{
+    std::lock_guard<std::mutex> lk(g_geomMutex);
+    evict_geom_dev_locked();
 }
 
 /* These are the strong definitions called by the CPU-TU dispatcher when the

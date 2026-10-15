@@ -108,6 +108,7 @@ void cmg_hip_group_compress_f64(size_t, const double *, const uint32_t *, const 
                                 const uint32_t *, size_t, size_t, double, int,
                                 double *, double *, double *, double *, int *, uint32_t *,
                                 void **, void **, uint32_t *);
+void cmg_hip_evict_geometry_cache(void);
 void cmg_hip_reduce_stats_f32(const float *, size_t, double *, double *, double *);
 void cmg_hip_reduce_stats_f64(const double *, size_t, double *, double *, double *);
 void cmg_hip_group_recombine_f32(const float *, const uint32_t *, const uint32_t *,
@@ -285,6 +286,13 @@ size_t cmg_build_coord_groups(cmg_backend_t be,
 
 /* Fused device-resident group_centroid compress. Only implemented on HIP; on
  * the CPU backend it returns 0 so the operator uses the staged path. */
+void cmg_evict_geometry_cache(void)
+{
+#ifdef CMG_HAVE_HIP
+    cmg_hip_evict_geometry_cache();
+#endif
+}
+
 int cmg_group_compress_f32(cmg_backend_t be, size_t blockId, const float *field,
     const uint32_t *gid, const uint32_t *gperm, const uint32_t *nperm,
     size_t nnodes, size_t ngroups, double tol_resi, int adaptive,
